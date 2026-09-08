@@ -1,0 +1,35 @@
+# E4 H0 contract. Paths, held-out family, seed, and experiment name are
+# injected by scripts/run_e4.py so each fold has a self-contained config.
+model: hierarchical
+family_balanced_sampling: false
+batch_size: 16
+num_workers: 2
+worker_tmpdir: /tmp
+pin_memory: true
+prefetch_factor: 2
+thread_prefetch: false
+precision: bf16
+epochs: 400
+patience: 20
+learning_rate: 0.001
+weight_decay: 0.0001
+hidden_dim: 64
+num_layers: 3
+heads: 1
+dropout: 0.15
+use_global_features: true
+use_context: true
+context_mode: core
+split_heads: true
+hurdle_heads: true
+hurdle_prediction_mode: threshold
+loss: log_huber_hurdle
+log_huber_delta: 0.35
+hurdle_classification_weight: 0.25
+early_stopping_metric: smape
+gradient_clip_norm: 1.0
+lr_scheduler_patience: 8
+lr_scheduler_factor: 0.5
+min_learning_rate: 0.000001
+checkpoint_interval: 1
+verbose: 2

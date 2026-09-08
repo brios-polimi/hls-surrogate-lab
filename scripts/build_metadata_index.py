@@ -13,6 +13,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_REPO_ROOT / "src"))
 
 from ll_hls4ml.io.discovery import iter_graph_paths
+from ll_hls4ml.data.signatures import canonical_family, signature_fields
 
 
 def iter_json_array(path: Path, chunk_size: int = 1 << 20):
@@ -78,7 +79,8 @@ def _group_id(row: dict, source_name: str) -> str:
 
 def _metadata(row: dict, split: str, source_name: str) -> dict:
     latency = row.get("latency_report") or {}
-    return {
+    model_name = str((row.get("meta_data") or {}).get("model_name", ""))
+    metadata = {
         "backend": str(row.get("backend") or "vitis"),
         "target_part": str(row.get("target_part") or ""),
         "vivado_version": str(row.get("vivado_version") or ""),
@@ -86,7 +88,10 @@ def _metadata(row: dict, split: str, source_name: str) -> dict:
         "target_clock": latency.get("target_clock"),
         "dataset_split": split,
         "group_id": _group_id(row, source_name),
+        "model_name": model_name,
     }
+    metadata.update(signature_fields(source_name, model_name))
+    return metadata
 
 
 def main() -> None:
@@ -97,6 +102,13 @@ def main() -> None:
         type=Path,
         default=Path("../data/labels/wa-hls4ml"),
     )
+    parser.add_argument(
+        "--tensor-index",
+        type=Path,
+        help="Limit metadata extraction to paths in this tensor labels.json",
+    )
+    parser.add_argument("--archives", type=int)
+    parser.add_argument("--families", nargs="+")
     parser.add_argument(
         "--output",
         type=Path,
@@ -115,9 +127,28 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    graph_ids = {
-        path.stem for _kernel, path in iter_graph_paths(args.graph_dir)
-    }
+    targets_by_source = None
+    if args.tensor_index is not None:
+        tensor_index = json.loads(args.tensor_index.read_text())
+        targets_by_source: dict[tuple[str, str], set[str]] = {}
+        for tensor_path in tensor_index["labels"]:
+            parts = Path(tensor_path).parts
+            family = canonical_family(parts[0])
+            if args.families and family not in args.families and family != "exemplar":
+                continue
+            if family != "exemplar" and args.archives is not None:
+                archive = int(parts[1].removeprefix("archive_"))
+                if archive > args.archives:
+                    continue
+            sample_metadata = tensor_index.get("metadata", {}).get(tensor_path, {})
+            split = str(sample_metadata.get("dataset_split", "exemplar" if family == "exemplar" else "")).lower()
+            split = "val" if split == "validation" else split
+            targets_by_source.setdefault((split, family), set()).add(Path(tensor_path).stem)
+        graph_ids = set().union(*targets_by_source.values())
+    else:
+        graph_ids = {
+            path.stem for _kernel, path in iter_graph_paths(args.graph_dir)
+        }
     if args.reuse_output:
         found = json.loads(args.output.read_text())
     else:
@@ -125,6 +156,13 @@ def main() -> None:
         label_paths = sorted(args.labels_dir.glob("*/*.json"))
         for path in label_paths:
             split = path.parent.name
+            family = canonical_family(path.name)
+            relevant_ids = (
+                targets_by_source.get((split, family), set())
+                if targets_by_source is not None else graph_ids
+            )
+            if not relevant_ids:
+                continue
             matched_before = len(found)
             for row in iter_json_array(path):
                 if not isinstance(row, dict):
@@ -133,7 +171,7 @@ def main() -> None:
                     (row.get("meta_data") or {}).get("artifacts_file", "")
                 )
                 graph_id = artifact.removesuffix(".tar.gz")
-                if graph_id in graph_ids:
+                if graph_id in relevant_ids:
                     found[graph_id] = _metadata(row, split, path.name)
             print(
                 f"{path.name}: +{len(found) - matched_before} matches",

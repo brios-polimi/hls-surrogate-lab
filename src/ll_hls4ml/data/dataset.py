@@ -123,6 +123,7 @@ class HeteroGraphDataset(Dataset):
 
     def __getitem__(self, idx: int) -> HeteroData:
         data = torch.load(self.paths[idx], weights_only=False)
+        data.graph_id = self.paths[idx].stem
         if self.transform:
             data = self.transform(data)
         return data

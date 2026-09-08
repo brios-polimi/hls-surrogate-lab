@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
-from contextlib import nullcontext
 import csv
 import json
 import os
@@ -28,6 +27,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_REPO_ROOT / "src"))
 
 from ll_hls4ml.data.dataset import HeteroGraphDataset
+from ll_hls4ml.data.augmentations import resolve as resolve_transform
 from ll_hls4ml.data.splits import (
     benchmark_train_val_test_split,
     limit_subset_archives,
@@ -58,7 +58,7 @@ from ll_hls4ml.training.distributed import (
     setup_from_env,
     unwrap_model,
 )
-from ll_hls4ml.training.loops import _json_converter, fit
+from ll_hls4ml.training.loops import _autocast, _json_converter, fit
 from ll_hls4ml.training.telemetry import NvidiaSmiMonitor
 from ll_hls4ml.training.targets import (
     apply_hurdle_prediction,
@@ -116,6 +116,7 @@ def _model_from_config(config: dict, vocab_size: int, max_pos: int, train_ds):
     }
     hierarchical_models = {
         "hierarchical",
+        "hierarchical_topology_destroyed",
         "hierarchical_high_level_fusion",
         "hierarchical_sequence",
         "hierarchical_block_attention",
@@ -158,6 +159,7 @@ def _model_from_config(config: dict, vocab_size: int, max_pos: int, train_ds):
         "hetero_gat",
         "hetero_relational",
         "hierarchical",
+        "hierarchical_topology_destroyed",
         "hierarchical_high_level_fusion",
         "hierarchical_sequence",
         "hierarchical_block_attention",
@@ -204,7 +206,7 @@ def _model_from_config(config: dict, vocab_size: int, max_pos: int, train_ds):
                         ),
                     }
                 )
-    elif model_name == "mlp":
+    elif model_name in {"mlp", "pooled_control"}:
         common["num_var_embed_layers"] = config.get("num_var_embed_layers", 2)
         common["node_aggr"] = config.get("node_aggr", "concat")
     return build(model_name, **common)
@@ -260,15 +262,10 @@ def _predict(model, loader, device):
                 structures.extend(graph_structure_rows(batch))
             batch = batch.to(device, non_blocking=device.type == "cuda")
             precision = getattr(base_model, "inference_precision", "float32")
-            amp = (
-                torch.autocast(device_type="cuda", dtype=torch.bfloat16)
-                if device.type == "cuda" and precision == "bf16"
-                else nullcontext()
-            )
             if device.type == "cuda":
                 torch.cuda.synchronize()
             started = time.perf_counter()
-            with amp:
+            with _autocast(device, precision):
                 raw_prediction = base_model(batch)
             if device.type == "cuda":
                 torch.cuda.synchronize()
@@ -688,7 +685,7 @@ def main() -> None:
         raise ValueError("No non-exemplar kernel types found in the tensor directory")
     main_relative_paths = None
     exemplar_relative_paths = None
-    if paper_model:
+    if saved_manifest is not None:
         main_relative_paths = [
             row["tensor_path"]
             for split in ("train", "validation", "test")
@@ -697,12 +694,20 @@ def main() -> None:
         exemplar_relative_paths = [
             row["tensor_path"] for row in saved_manifest["exemplar"]
         ]
+    transform_name = config.get("graph_transform")
+    if model_name == "hierarchical_topology_destroyed":
+        transform_name = transform_name or "permute_destinations_within_function_v2"
+    graph_transform = (
+        resolve_transform(transform_name, seed=int(config.get("corruption_seed", seed)))
+        if transform_name else None
+    )
     dataset = HeteroGraphDataset(
         tensor_dir,
         types=kernel_types,
         max_per_type=max_per_type,
         silent=not main_process,
         relative_paths=main_relative_paths,
+        transform=graph_transform,
     )
     exemplar_dataset = HeteroGraphDataset(
         tensor_dir,
@@ -710,6 +715,7 @@ def main() -> None:
         max_per_type=None,
         silent=not main_process,
         relative_paths=exemplar_relative_paths,
+        transform=graph_transform,
     )
     split_coverage = None
     if saved_manifest is not None:
@@ -916,8 +922,8 @@ def main() -> None:
 
     model = _model_from_config(config, len(vocab), max_pos, train_ds)
     precision = config.get("precision", "float32")
-    if precision not in {"float32", "bf16"}:
-        raise ValueError("precision must be 'float32' or 'bf16'")
+    if precision not in {"float32", "fp16", "bf16"}:
+        raise ValueError("precision must be 'float32', 'fp16', or 'bf16'")
     if precision == "bf16" and device.type == "cuda" and not torch.cuda.is_bf16_supported():
         raise ValueError("This CUDA device does not support bfloat16 training")
     model.inference_precision = precision
@@ -965,20 +971,35 @@ def main() -> None:
     resume_checkpoint_path = config.get("resume_checkpoint_path")
     if resume_checkpoint_path:
         resume_checkpoint_path = _config_path(resume_checkpoint_path, config_dir)
+    if (
+        main_process and run_dir.exists() and any(run_dir.iterdir())
+        and resume_checkpoint_path is None and args.evaluate_checkpoint is None
+    ):
+        raise FileExistsError(
+            f"Refusing to overwrite existing run directory without resume/evaluation: {run_dir}"
+        )
     if main_process:
         run_dir.mkdir(parents=True, exist_ok=True)
-    split_manifest = _split_manifest(
-        dataset,
-        {"train": train_ds, "validation": val_ds, "test": test_ds},
-        tensor_dir,
-    )
-    split_manifest.update(
-        _split_manifest(
-            exemplar_dataset,
-            {"exemplar": exemplar_ds},
+    if saved_manifest is not None and config.get("train_scale") is None:
+        # Preserve release/signature provenance rather than reducing saved rows
+        # back to path-only membership records.
+        split_manifest = {
+            name: [dict(row) for row in saved_manifest[name]]
+            for name in ("train", "validation", "test", "exemplar")
+        }
+    else:
+        split_manifest = _split_manifest(
+            dataset,
+            {"train": train_ds, "validation": val_ds, "test": test_ds},
             tensor_dir,
         )
-    )
+        split_manifest.update(
+            _split_manifest(
+                exemplar_dataset,
+                {"exemplar": exemplar_ds},
+                tensor_dir,
+            )
+        )
     membership = cohort_membership(split_manifest)
     manifest_hash = split_sha256(split_manifest)
     checkpoint_cadence = int(config.get("checkpoint_interval", 5))

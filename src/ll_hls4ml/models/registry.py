@@ -23,6 +23,7 @@ MODELS: dict[str, type[nn.Module]] = {
     "hetero_gat": CDFGHeteroGAT,
     "hetero_relational": CDFGHeteroRelational,
     "hierarchical": CDFGHierarchical,
+    "hierarchical_topology_destroyed": CDFGHierarchical,
     "hierarchical_sequence": CDFGHierarchicalSequence,
     "hierarchical_block_attention": CDFGHierarchicalBlockAttention,
     "hierarchical_memory_dual": CDFGHierarchicalMemoryDual,
@@ -32,6 +33,7 @@ MODELS: dict[str, type[nn.Module]] = {
     # Compatibility alias for existing configs and recorded experiments.
     "rgcn": CDFGHeteroGAT,
     "mlp": MLP,
+    "pooled_control": MLP,
 }
 
 

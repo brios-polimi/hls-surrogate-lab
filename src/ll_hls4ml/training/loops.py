@@ -38,9 +38,10 @@ from ll_hls4ml.io.schema import LABEL_KEYS
 def _autocast(device: torch.device, precision: str):
     if device.type != "cuda" or precision == "float32":
         return nullcontext()
-    if precision != "bf16":
-        raise ValueError("precision must be 'float32' or 'bf16'")
-    return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+    dtypes = {"bf16": torch.bfloat16, "fp16": torch.float16}
+    if precision not in dtypes:
+        raise ValueError("precision must be 'float32', 'fp16', or 'bf16'")
+    return torch.autocast(device_type="cuda", dtype=dtypes[precision])
 
 
 def _use_progress_bar() -> bool:
@@ -155,16 +156,28 @@ def _save_checkpoint(
     scheduler,
     path,
     training_state: dict | None = None,
+    grad_scaler=None,
 ):
     checkpoint = {
         "epoch": epoch,
         "model": unwrap_model(model).state_dict(),
         "optimizer": optimizer.state_dict(),
         "scheduler": scheduler.state_dict() if scheduler else None,
+        "grad_scaler": grad_scaler.state_dict() if grad_scaler is not None else None,
+        # Epoch-boundary RNG state makes a single-GPU Colab/Kaggle restart
+        # continue the same shuffle/dropout trajectory instead of replaying it.
+        "torch_rng_state": torch.get_rng_state(),
+        "cuda_rng_state_all": (
+            torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+        ),
     }
     if training_state is not None:
         checkpoint["training_state"] = training_state
-    torch.save(checkpoint, path)
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    torch.save(checkpoint, temporary)
+    temporary.replace(path)
 
 
 def train_one_epoch(
@@ -178,6 +191,7 @@ def train_one_epoch(
     precision: str = "float32",
     return_profile: bool = False,
     gradient_clip_norm: float | None = 1.0,
+    grad_scaler=None,
 ):
     model.train()
     base_model = unwrap_model(model)
@@ -209,13 +223,21 @@ def train_one_epoch(
         with _autocast(device, precision):
             pred = model(batch)
             loss = criterion(pred, target)
-        loss.backward()
+        if grad_scaler is not None:
+            grad_scaler.scale(loss).backward()
+            grad_scaler.unscale_(optimizer)
+        else:
+            loss.backward()
         if gradient_clip_norm is not None:
             gradient_norm = torch.nn.utils.clip_grad_norm_(
                 model.parameters(), gradient_clip_norm
             )
             gradient_norm_sum += float(gradient_norm.detach())
-        optimizer.step()
+        if grad_scaler is not None:
+            grad_scaler.step(optimizer)
+            grad_scaler.update()
+        else:
+            optimizer.step()
         optimizer_steps += 1
 
         n = batch.num_graphs
@@ -387,6 +409,9 @@ def fit(
     history = []
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
+    grad_scaler = torch.amp.GradScaler(
+        "cuda", enabled=(device.type == "cuda" and precision == "fp16")
+    )
     if patience > 0:
         patience_counter = 0
         best_metric = float("-inf") if mode == "max" else float("inf")
@@ -398,6 +423,17 @@ def fit(
         optimizer.load_state_dict(checkpoint["optimizer"])
         if scheduler is not None and checkpoint["scheduler"] is not None:
             scheduler.load_state_dict(checkpoint["scheduler"])
+        if checkpoint.get("grad_scaler") is not None:
+            grad_scaler.load_state_dict(checkpoint["grad_scaler"])
+        if checkpoint.get("torch_rng_state") is not None:
+            torch.set_rng_state(checkpoint["torch_rng_state"].cpu())
+        if (
+            device.type == "cuda"
+            and not distributed
+            and checkpoint.get("cuda_rng_state_all") is not None
+        ):
+            states = [state.cpu() for state in checkpoint["cuda_rng_state_all"]]
+            torch.cuda.set_rng_state_all(states)
         start_epoch = checkpoint["epoch"] + 1
         resumed_from_epoch = int(checkpoint["epoch"])
         training_state = checkpoint.get("training_state", {})
@@ -455,6 +491,7 @@ def fit(
             precision=precision,
             return_profile=True,
             gradient_clip_norm=gradient_clip_norm,
+            grad_scaler=grad_scaler if grad_scaler.is_enabled() else None,
         )
         if isinstance(train_result, tuple):
             train_loss, train_profile = train_result
@@ -579,6 +616,7 @@ def fit(
                             "peak_gpu_memory_mb"
                         ],
                     },
+                    grad_scaler=grad_scaler if grad_scaler.is_enabled() else None,
                 )
             else:
                 patience_counter += 1
@@ -613,6 +651,7 @@ def fit(
                     "best_wall_seconds": best_wall_seconds,
                     "peak_gpu_memory_mb": history[-1]["peak_gpu_memory_mb"],
                 },
+                grad_scaler=grad_scaler if grad_scaler.is_enabled() else None,
             )
             print(f"Model saved to {backup_path}")
 
@@ -664,6 +703,7 @@ def fit(
                 "best_wall_seconds": None,
                 "peak_gpu_memory_mb": history[-1]["peak_gpu_memory_mb"],
             },
+            grad_scaler=grad_scaler if grad_scaler.is_enabled() else None,
         )
 
     if distributed:
