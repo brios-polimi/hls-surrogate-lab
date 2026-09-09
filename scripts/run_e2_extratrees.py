@@ -59,6 +59,7 @@ def main() -> None:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--feature-cache", type=Path, required=True)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--experiment-name")
     args = parser.parse_args()
 
     manifest = json.loads(args.manifest.read_text())
@@ -102,7 +103,7 @@ def main() -> None:
     fit_seconds = time.perf_counter() - started
     mode = choose_mode(model, validation_x, validation_y)
 
-    experiment = f"e2_extra_trees_seed{args.seed}"
+    experiment = args.experiment_name or f"e2_extra_trees_seed{args.seed}"
     metrics = []
     predictions = []
     for split in ("validation", "test", "exemplar"):

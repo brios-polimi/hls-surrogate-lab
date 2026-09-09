@@ -77,18 +77,30 @@ class InstructionFlowLayer(nn.Module):
         control_edges: torch.Tensor,
         def_use_edges: torch.Tensor,
         control_features: torch.Tensor | None,
+        use_messages: bool = True,
     ) -> torch.Tensor:
-        control = _messages(
-            self.control(state),
-            control_edges,
-            state.size(0),
-            control_features,
-        )
-        data = _messages(
-            self.def_use(state),
-            def_use_edges,
-            state.size(0),
-        )
+        control_source = self.control(state)
+        data_source = self.def_use(state)
+        if use_messages:
+            control = _messages(
+                control_source,
+                control_edges,
+                state.size(0),
+                control_features,
+            )
+            data = _messages(
+                data_source,
+                def_use_edges,
+                state.size(0),
+            )
+        else:
+            # Keep the exact layer and parameter scaffold while removing only
+            # adjacency-derived contributions. The zero dependencies also keep
+            # all parameters participating in distributed gradient reduction.
+            control = control_source.sum(dim=0, keepdim=True).expand_as(state) * 0
+            if control_features is not None:
+                control = control + control_features.sum(dim=0, keepdim=True) * 0
+            data = data_source.sum(dim=0, keepdim=True).expand_as(state) * 0
         updated = self.norm(state + self.dropout(F.relu(control + data)))
         return updated
 
@@ -106,9 +118,13 @@ class BlockFlowLayer(nn.Module):
         self,
         state: torch.Tensor,
         cfg_edges: torch.Tensor,
+        use_messages: bool = True,
     ) -> torch.Tensor:
-        message = _messages(
-            self.message(state), cfg_edges, state.size(0)
+        message_source = self.message(state)
+        message = (
+            _messages(message_source, cfg_edges, state.size(0))
+            if use_messages
+            else message_source.sum(dim=0, keepdim=True).expand_as(state) * 0
         )
         updated = self.norm(state + self.dropout(F.relu(message)))
         return updated
@@ -141,6 +157,7 @@ class CDFGHierarchical(nn.Module):
         hurdle_heads: bool = False,
         hurdle_prediction_mode: str = "expected",
         build_head: bool = True,
+        use_local_messages: bool = True,
     ):
         super().__init__()
         if hurdle_heads and not split_heads:
@@ -155,6 +172,7 @@ class CDFGHierarchical(nn.Module):
         self.hurdle_prediction_mode = hurdle_prediction_mode
         self.use_global_features = use_global_features
         self.use_context = use_context
+        self.use_local_messages = use_local_messages
         instruction_num_layers = (
             num_layers if instruction_num_layers is None else instruction_num_layers
         )
@@ -388,6 +406,7 @@ class CDFGHierarchical(nn.Module):
                     local_control,
                     local_def_use,
                     edge_features[control][control_mask],
+                    use_messages=self.use_local_messages,
                 )
 
             instruction_pool = multi_pool(
@@ -409,7 +428,11 @@ class CDFGHierarchical(nn.Module):
             local_cfg = block_local[block_cfg[:, cfg_mask]]
             block_state = current_block
             for layer in self.block_layers:
-                block_state = layer(block_state, local_cfg)
+                block_state = layer(
+                    block_state,
+                    local_cfg,
+                    use_messages=self.use_local_messages,
+                )
 
             block_pool = multi_pool(
                 block_state,

@@ -23,6 +23,7 @@ MODELS: dict[str, type[nn.Module]] = {
     "hetero_gat": CDFGHeteroGAT,
     "hetero_relational": CDFGHeteroRelational,
     "hierarchical": CDFGHierarchical,
+    "hierarchical_no_local_message": CDFGHierarchical,
     "hierarchical_topology_destroyed": CDFGHierarchical,
     "hierarchical_sequence": CDFGHierarchicalSequence,
     "hierarchical_block_attention": CDFGHierarchicalBlockAttention,
@@ -44,4 +45,6 @@ def list_models() -> list[str]:
 def build(name: str, **kwargs) -> nn.Module:
     if name not in MODELS:
         raise KeyError(f"Unknown model '{name}'. Available: {list_models()}")
+    if name == "hierarchical_no_local_message":
+        kwargs["use_local_messages"] = False
     return MODELS[name](**kwargs)

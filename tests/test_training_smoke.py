@@ -170,6 +170,15 @@ class TrainingSmokeTests(unittest.TestCase):
                         "hurdle_heads": True,
                     },
                 ),
+                (
+                    "hierarchical_no_local_message",
+                    {
+                        "edge_pos_vocab_size": 2,
+                        "use_context": True,
+                        "split_heads": True,
+                        "hurdle_heads": True,
+                    },
+                ),
                 *(
                     (
                         name,

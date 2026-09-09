@@ -116,6 +116,7 @@ def _model_from_config(config: dict, vocab_size: int, max_pos: int, train_ds):
     }
     hierarchical_models = {
         "hierarchical",
+        "hierarchical_no_local_message",
         "hierarchical_topology_destroyed",
         "hierarchical_high_level_fusion",
         "hierarchical_sequence",
@@ -159,6 +160,7 @@ def _model_from_config(config: dict, vocab_size: int, max_pos: int, train_ds):
         "hetero_gat",
         "hetero_relational",
         "hierarchical",
+        "hierarchical_no_local_message",
         "hierarchical_topology_destroyed",
         "hierarchical_high_level_fusion",
         "hierarchical_sequence",
@@ -167,6 +169,8 @@ def _model_from_config(config: dict, vocab_size: int, max_pos: int, train_ds):
         "rgcn",
     }:
         common["edge_pos_vocab_size"] = max_pos
+        if model_name == "hierarchical_no_local_message":
+            common["use_local_messages"] = False
         if model_name not in hierarchical_models:
             common["aggr"] = config.get("aggr", "sum")
         if model_name == "hetero_relational":
