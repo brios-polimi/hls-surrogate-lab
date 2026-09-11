@@ -66,7 +66,8 @@ class HierarchicalHighLevelFusion(nn.Module):
             hurdle_heads=hurdle_heads,
         )
 
-    def forward(self, data):
+    def encode(self, data):
+        """Return the fused representation before the prediction heads."""
         cdfg = self.cdfg_encoder.encode(data)
         layer_store = data["high_level_layer"]
         high_level = self.high_level_encoder(
@@ -79,4 +80,7 @@ class HierarchicalHighLevelFusion(nn.Module):
             data.high_level_strategy,
             data.high_level_io_type,
         )
-        return self.classifier(torch.cat([cdfg, high_level], dim=-1))
+        return torch.cat([cdfg, high_level], dim=-1)
+
+    def forward(self, data):
+        return self.classifier(self.encode(data))
