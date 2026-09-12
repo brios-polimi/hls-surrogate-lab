@@ -60,8 +60,8 @@ STUDY_ID = "e5b_matched_scratch_v1"
 PROTOCOL_ID = "e5b_late_added_matched_scratch_2026_09_11"
 DEFAULT_E5_ROOT = _REPO_ROOT / "artifacts/results/e5_adaptation_v1"
 DEFAULT_OUTPUT = _REPO_ROOT / "artifacts/results/e5b_matched_scratch_v1"
-PRIMARY_BUDGETS = (32,)
-PRIMARY_DRAW_SEEDS = (42,)
+PRIMARY_BUDGETS = (16, 32)
+PRIMARY_DRAW_SEEDS = (7, 42, 137)
 ALLOWED_BUDGETS = (16, 32)
 ALLOWED_DRAW_SEEDS = (7, 42, 137)
 EXPECTED_E5_METADATA_SHA256 = (
@@ -523,7 +523,7 @@ def _analysis_dir(metadata: dict, draw_seeds, budgets) -> Path:
     else:
         draws = "-".join(map(str, draw_seeds))
         sizes = "-".join(map(str, budgets))
-        name = f"analysis_expanded_draws{draws}_k{sizes}"
+        name = f"analysis_selection_draws{draws}_k{sizes}"
     return Path(metadata["output_dir"]) / name
 
 
@@ -738,8 +738,9 @@ def _report(summary: pd.DataFrame, paired: pd.DataFrame, workload: list[dict]) -
 
 This is a late-added control frozen after the original E5 query was inspected.
 No E5b hyperparameter or checkpoint decision used query labels.
-The primary analysis uses one fixed support draw at k=32 across seven outer
-architecture units; it does not estimate robustness to support-set sampling.
+The primary analysis uses three fixed support draws at k=16 and k=32 across
+seven outer architecture units. Draws are treated as repeated measures within
+architecture, not as independent outer replicates.
 
 ## Equal-architecture query results
 
@@ -1038,13 +1039,13 @@ def _resolve_inputs(args) -> tuple[dict, Path]:
         ],
         "primary_budgets": list(PRIMARY_BUDGETS),
         "primary_draw_seeds": list(PRIMARY_DRAW_SEEDS),
-        "primary_new_fits": 7,
+        "primary_new_fits": 42,
         "optional_expansion_budgets": list(ALLOWED_BUDGETS),
         "optional_expansion_draw_seeds": list(ALLOWED_DRAW_SEEDS),
         "scope_rationale": (
-            "One matched k=32 draw-42 scratch fit per architecture closes the "
-            "main attribution gap within the available compute; support-draw "
-            "robustness is explicitly not claimed."
+            "Matched scratch fits at k=16 and k=32 across all three frozen "
+            "support draws close the attribution gap while quantifying "
+            "support-set sensitivity."
         ),
         "epochs": SCRATCH_EPOCHS,
         "patience": SCRATCH_PATIENCE,
@@ -1109,13 +1110,13 @@ def main() -> None:
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""Examples:
-  # Review the primary seven-fit schedule.
+  # Review the frozen 21-bundle / 42-fit schedule.
   python scripts/run_e5b.py --dry-run
 
   # Run the complete control on the RTX PRO 6000 and resume interruptions.
   python scripts/run_e5b.py --resume --jobs-per-device 2
 
-  # Optionally expand the robustness matrix later.
+  # Fill a fit subset without exposing query evaluation.
   python scripts/run_e5b.py --stage fit --budgets 16 --draw-seeds 7 --resume
 """,
     )
@@ -1199,8 +1200,8 @@ def main() -> None:
                 PRIMARY_BUDGETS,
             ):
                 raise RuntimeError(
-                    "E5b query evaluation is sealed until all seven primary "
-                    "draw-42 k=32 scratch fits complete"
+                    "E5b query evaluation is sealed until all 42 primary "
+                    "scratch fits complete"
                 )
             _dispatch(
                 stage, metadata, metadata_path, architectures, draw_seeds, budgets,

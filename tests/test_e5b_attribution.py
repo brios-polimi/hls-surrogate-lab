@@ -20,10 +20,10 @@ def sha256(path: Path) -> str:
 
 
 class E5bProtocolTests(unittest.TestCase):
-    def test_primary_protocol_requires_seven_runs_not_forty_two(self):
-        self.assertEqual(PRIMARY_BUDGETS, (32,))
-        self.assertEqual(PRIMARY_DRAW_SEEDS, (42,))
-        self.assertEqual(7 * len(PRIMARY_BUDGETS) * len(PRIMARY_DRAW_SEEDS), 7)
+    def test_primary_protocol_requires_forty_two_small_support_runs(self):
+        self.assertEqual(PRIMARY_BUDGETS, (16, 32))
+        self.assertEqual(PRIMARY_DRAW_SEEDS, (7, 42, 137))
+        self.assertEqual(7 * len(PRIMARY_BUDGETS) * len(PRIMARY_DRAW_SEEDS), 42)
 
     def test_k16_and_k32_share_initialization_but_not_training_seed(self):
         init16, train16 = _run_seeds("architecture-a", 42, 16)
@@ -31,12 +31,12 @@ class E5bProtocolTests(unittest.TestCase):
         self.assertEqual(init16, init32)
         self.assertNotEqual(train16, train32)
 
-    def test_expanded_analysis_cannot_overwrite_primary_analysis(self):
+    def test_subset_analysis_cannot_overwrite_primary_analysis(self):
         metadata = {"output_dir": "/tmp/e5b-test"}
-        primary = _analysis_dir(metadata, (42,), (32,))
-        expanded = _analysis_dir(metadata, (7, 42, 137), (16, 32))
+        primary = _analysis_dir(metadata, (7, 42, 137), (16, 32))
+        subset = _analysis_dir(metadata, (42,), (32,))
         self.assertEqual(primary.name, "analysis")
-        self.assertNotEqual(primary, expanded)
+        self.assertNotEqual(primary, subset)
 
 
 class E5bCompletionTests(unittest.TestCase):
