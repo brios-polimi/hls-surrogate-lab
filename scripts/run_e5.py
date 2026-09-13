@@ -1544,7 +1544,13 @@ def _analyze(
     _write_analysis_figures(
         analysis_dir, summary, query, paired_summary, degradation
     )
-    report = _analysis_report(summary, paired_summary, degradation, workload)
+    report = _analysis_report(
+        summary,
+        paired_summary,
+        degradation,
+        workload,
+        Path(metadata["source_checkpoint"]).name,
+    )
     _write_text_atomic(analysis_dir / "REPORT.md", report)
     _write_json_atomic(analysis_dir / "analysis_provenance.json", {
         "study_id": STUDY_ID,
@@ -1645,6 +1651,7 @@ def _analysis_report(
     paired: pd.DataFrame,
     degradation: pd.DataFrame,
     workload: list[dict],
+    source_checkpoint_name: str,
 ) -> str:
     headline = summary[summary["scope"] == "overall"].copy()
     headline["result"] = headline.apply(
@@ -1663,7 +1670,7 @@ def _analysis_report(
 
 ## Contract
 
-- Frozen source: E2 seed-42 fusion checkpoint.
+- Frozen source checkpoint: `{source_checkpoint_name}`.
 - Outer reporting unit: seven exemplar architecture IDs.
 - Support budgets: 0, 4, 16, and 32 with three nested deterministic draws.
 - Checkpoint and hyperparameter selection: adaptation-validation only.

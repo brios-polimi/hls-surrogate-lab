@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import subprocess
@@ -335,6 +336,59 @@ class TrainingSmokeTests(unittest.TestCase):
                 [row["epoch"] for row in evaluated_result["training_history"]],
                 [1],
             )
+
+            fit_only_config = json.loads(config_path.read_text())
+            fit_only_config.update({
+                "experiment_name": "cli_fit_only",
+                "fit_only": True,
+                "evaluation_splits": ["validation", "test"],
+            })
+            fit_only_path = root / "fit_only.json"
+            fit_only_path.write_text(json.dumps(fit_only_config))
+            subprocess.run(
+                [
+                    sys.executable,
+                    str(repository / "scripts" / "train.py"),
+                    "--config",
+                    str(fit_only_path),
+                ],
+                check=True,
+                cwd=repository,
+                env=environment,
+            )
+            fit_only_dir = root / "results" / "cli_fit_only"
+            fit_summary = json.loads(
+                (fit_only_dir / "fit_summary.json").read_text()
+            )
+            fit_checkpoint = (
+                root / "cli_checkpoints" / "cli_fit_only_checkpoint.pt"
+            )
+            self.assertTrue(fit_checkpoint.is_file())
+            self.assertEqual(
+                fit_summary["checkpoint_sha256"],
+                hashlib.sha256(fit_checkpoint.read_bytes()).hexdigest(),
+            )
+            self.assertFalse((fit_only_dir / "predictions.csv").exists())
+            subprocess.run(
+                [
+                    sys.executable,
+                    str(repository / "scripts" / "train.py"),
+                    "--config",
+                    str(fit_only_path),
+                    "--evaluate-checkpoint",
+                    str(fit_checkpoint),
+                ],
+                check=True,
+                cwd=repository,
+                env=environment,
+            )
+            evaluated_splits = {
+                row["split"]
+                for row in json.loads(
+                    (fit_only_dir / "summary.json").read_text()
+                )["metrics"]
+            }
+            self.assertEqual(evaluated_splits, {"validation", "test"})
 
             if os.environ.get("LL_HLS4ML_SKIP_DDP_SMOKE") == "1":
                 return

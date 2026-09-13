@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 from collections import Counter
 import csv
+import hashlib
 import json
 import os
 import random
@@ -80,6 +81,14 @@ DISPLAY_LABELS = ["LUT", "FF", "DSP", "BRAM", "Cycles", "II"]
 PAPER_ORDER = ["BRAM", "DSP", "FF", "LUT", "Cycles", "II"]
 
 
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def _config_path(value: str, config_dir: Path) -> Path:
     path = Path(value)
     return path if path.is_absolute() else (config_dir / path).resolve()
@@ -111,6 +120,7 @@ def _model_from_config(config: dict, vocab_size: int, max_pos: int, train_ds):
     }
     model_name = config.get("model", "hetero_gat")
     high_level_models = {
+        "high_level_layer_gnn",
         "paper_high_level_gatv2",
         "paper_transformer",
     }
@@ -155,6 +165,24 @@ def _model_from_config(config: dict, vocab_size: int, max_pos: int, train_ds):
             max_layers=config.get("max_layers", 51),
             dropout=config.get("dropout", 0.1),
             target_log_shift=target_log_shift,
+        )
+    if model_name == "high_level_layer_gnn":
+        from ll_hls4ml.data.high_level import PROCESSED_FEATURE_DIM
+
+        return build(
+            model_name,
+            input_dim=PROCESSED_FEATURE_DIM,
+            y_means=y_means,
+            y_stds=y_stds,
+            hidden_dim=config.get("hidden_dim", 64),
+            num_layers=config.get("num_layers", 3),
+            heads=config.get("heads", 1),
+            dropout=config.get("dropout", 0.15),
+            encoder=config.get("high_level_encoder", "gatv2"),
+            hurdle_heads=config.get("hurdle_heads", True),
+            hurdle_prediction_mode=config.get(
+                "hurdle_prediction_mode", "threshold"
+            ),
         )
     if model_name in {
         "hetero_gat",
@@ -660,7 +688,11 @@ def main() -> None:
     vocab, max_pos, _counts = load_vocab(vocab_path)
 
     model_name = config.get("model", "hetero_gat")
-    paper_model = model_name in {"paper_high_level_gatv2", "paper_transformer"}
+    paper_model = model_name in {
+        "high_level_layer_gnn",
+        "paper_high_level_gatv2",
+        "paper_transformer",
+    }
     split_manifest_path = config.get("split_manifest_path")
     saved_manifest = None
     if split_manifest_path:
@@ -808,6 +840,7 @@ def main() -> None:
 
     if config.get("model") in {
         "hierarchical_high_level_fusion",
+        "high_level_layer_gnn",
         "paper_high_level_gatv2",
         "paper_transformer",
     }:
@@ -833,7 +866,11 @@ def main() -> None:
         high_level_means, high_level_stds = statistics_fn(
             high_level_cache, train_paths
         )
-        if config.get("model") in {"paper_high_level_gatv2", "paper_transformer"}:
+        if config.get("model") in {
+            "high_level_layer_gnn",
+            "paper_high_level_gatv2",
+            "paper_transformer",
+        }:
             def high_level_split(source, subset):
                 indices = list(subset.indices)
                 paths = [
@@ -1156,12 +1193,60 @@ def main() -> None:
                 "test": len(test_ds),
                 "exemplar": len(exemplar_ds),
             }
+            if config.get("fit_only") and args.evaluate_checkpoint is None:
+                history = getattr(base_model, "training_history", [])
+                _write_csv(run_dir / "learning_curves.csv", history)
+                _save_training_plots(run_dir, experiment_name, history)
+                fit_accounting = {
+                    "best_epoch": getattr(base_model, "best_epoch", None),
+                    "best_validation_smape": getattr(
+                        base_model, "best_metric", None
+                    ),
+                    "cumulative_training_seconds": getattr(
+                        base_model, "cumulative_training_seconds", None
+                    ),
+                    "best_wall_seconds": getattr(
+                        base_model, "best_wall_seconds", None
+                    ),
+                    "peak_gpu_memory_mb": getattr(
+                        base_model, "peak_gpu_memory_mb", None
+                    ),
+                    "stop_reason": getattr(base_model, "stop_reason", None),
+                    "gpu_telemetry": (
+                        gpu_monitor.summary() if gpu_monitor is not None else None
+                    ),
+                    "sizes": sizes,
+                    "checkpoint_sha256": _sha256(
+                        checkpoint_dir / f"{experiment_name}_checkpoint.pt"
+                    ),
+                }
+                resolved_config.update(fit_accounting)
+                resolved_config["wall_seconds"] = time.perf_counter() - run_started
+                (run_dir / "resolved_config.json").write_text(
+                    json.dumps(resolved_config, indent=2)
+                )
+                (run_dir / "fit_summary.json").write_text(
+                    json.dumps(fit_accounting, indent=2, default=_json_converter)
+                )
+                print(f"Wrote fit-only result bundle to {run_dir}")
+                return
             metric_rows = []
             prediction_rows = []
-            for split_name, loader in (
-                ("test", test_loader),
-                ("exemplar", exemplar_loader),
-            ):
+            evaluation_loaders = {
+                "validation": val_loader,
+                "test": test_loader,
+                "exemplar": exemplar_loader,
+            }
+            evaluation_splits = tuple(
+                config.get("evaluation_splits", ("test", "exemplar"))
+            )
+            unknown_splits = set(evaluation_splits) - set(evaluation_loaders)
+            if unknown_splits or len(evaluation_splits) != len(set(evaluation_splits)):
+                raise ValueError(
+                    f"Invalid evaluation_splits: {list(evaluation_splits)}"
+                )
+            for split_name in evaluation_splits:
+                loader = evaluation_loaders[split_name]
                 (
                     predictions,
                     targets,
