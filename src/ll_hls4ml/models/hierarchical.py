@@ -158,10 +158,15 @@ class CDFGHierarchical(nn.Module):
         hurdle_prediction_mode: str = "expected",
         build_head: bool = True,
         use_local_messages: bool = True,
+        use_block_messages: bool | None = None,
+        use_callee_messages: bool = True,
+        hierarchy_mode: str = "structured",
     ):
         super().__init__()
         if hurdle_heads and not split_heads:
             raise ValueError("hurdle_heads requires split_heads=True")
+        if hierarchy_mode not in {"structured", "orderless"}:
+            raise ValueError("hierarchy_mode must be 'structured' or 'orderless'")
         if instruction_vocab_size is None:
             if not node_vocab_sizes or "instruction" not in node_vocab_sizes:
                 raise ValueError("instruction_vocab_size is required")
@@ -173,6 +178,11 @@ class CDFGHierarchical(nn.Module):
         self.use_global_features = use_global_features
         self.use_context = use_context
         self.use_local_messages = use_local_messages
+        self.use_block_messages = (
+            use_local_messages if use_block_messages is None else use_block_messages
+        )
+        self.use_callee_messages = use_callee_messages
+        self.hierarchy_mode = hierarchy_mode
         instruction_num_layers = (
             num_layers if instruction_num_layers is None else instruction_num_layers
         )
@@ -259,6 +269,124 @@ class CDFGHierarchical(nn.Module):
             raise ValueError("Incomplete instruction/block/function containment")
         return instruction_block, block_function
 
+    @staticmethod
+    def _batch(data, node_type: str) -> torch.Tensor:
+        batch = getattr(data[node_type], "batch", None)
+        if batch is not None:
+            return batch
+        return torch.zeros(
+            data[node_type].num_nodes,
+            dtype=torch.long,
+            device=data[node_type].x.device,
+        )
+
+    def _encode_orderless(
+        self,
+        data,
+        base: dict[str, torch.Tensor],
+        edge_features: dict,
+        static_instruction: torch.Tensor,
+        instruction_block: torch.Tensor,
+        block_function: torch.Tensor,
+        block_pragma: torch.Tensor,
+        function_pragma: torch.Tensor,
+    ) -> torch.Tensor:
+        """Capacity-matched control without structured upper-level composition.
+
+        Instruction control/def-use propagation is intact. Reachable instruction,
+        block, and function states are then treated as orderless bags: every block
+        sees the same graph-wide instruction pool, block layers use self messages
+        only, and every function sees the same graph-wide block pool. Containment,
+        block-CFG, call edges, callee injection, and entry-function readout do not
+        determine the representation. All modules in the structured encoder remain
+        active so the control has the same parameter count and depth.
+        """
+        graph_count = int(getattr(data, "num_graphs", 1))
+        reachable_functions = data["function"].is_reachable.bool()
+        reachable_blocks = reachable_functions[block_function]
+        reachable_instructions = reachable_blocks[instruction_block]
+
+        instruction_ids = reachable_instructions.nonzero(as_tuple=False).flatten()
+        instruction_local = torch.full(
+            (data["instruction"].num_nodes,),
+            -1,
+            dtype=torch.long,
+            device=instruction_ids.device,
+        )
+        instruction_local[instruction_ids] = torch.arange(
+            instruction_ids.numel(), device=instruction_ids.device
+        )
+        control = ("instruction", "control", "instruction")
+        control_edges = data[control].edge_index
+        def_use_edges = data[DERIVED_DEF_USE_EDGE].edge_index
+        control_mask = (
+            reachable_instructions[control_edges[0]]
+            & reachable_instructions[control_edges[1]]
+        )
+        def_use_mask = (
+            reachable_instructions[def_use_edges[0]]
+            & reachable_instructions[def_use_edges[1]]
+        )
+        instruction_state = self.instruction_input(
+            static_instruction[instruction_ids]
+        )
+        for layer in self.instruction_layers:
+            instruction_state = layer(
+                instruction_state,
+                instruction_local[control_edges[:, control_mask]],
+                instruction_local[def_use_edges[:, def_use_mask]],
+                edge_features[control][control_mask],
+                use_messages=self.use_local_messages,
+            )
+        instruction_batch = self._batch(data, "instruction")[instruction_ids]
+        instruction_pool = multi_pool(
+            instruction_state, instruction_batch, graph_count
+        )
+
+        block_ids = reachable_blocks.nonzero(as_tuple=False).flatten()
+        block_batch = self._batch(data, "block")[block_ids]
+        block_state = self.block_input(
+            torch.cat(
+                [
+                    base["block"][block_ids],
+                    block_pragma[block_ids],
+                    instruction_pool[block_batch],
+                ],
+                dim=-1,
+            )
+        )
+        self_edges = torch.arange(block_ids.numel(), device=block_ids.device)
+        self_edges = torch.stack([self_edges, self_edges])
+        for layer in self.block_layers:
+            block_state = layer(block_state, self_edges, use_messages=True)
+        block_pool = multi_pool(block_state, block_batch, graph_count)
+
+        function_ids = reachable_functions.nonzero(as_tuple=False).flatten()
+        function_batch = self._batch(data, "function")[function_ids]
+        function_state = self.function_input(
+            torch.cat(
+                [
+                    base["function"][function_ids],
+                    function_pragma[function_ids],
+                    block_pool[function_batch],
+                ],
+                dim=-1,
+            )
+        )
+        # Reuse the callee projection as a pointwise residual. This preserves
+        # active capacity without consuming call edges or callee states.
+        function_state = function_state + F.relu(self.callee_proj(function_state))
+        function_pool = multi_pool(function_state, function_batch, graph_count)
+        graph_state = self.root_readout(
+            torch.cat([instruction_pool, function_pool], dim=-1)
+        )
+        features = [graph_state]
+        if self.use_global_features:
+            features.append(self.global_features(data))
+        if self.use_context:
+            features.append(self.context_encoder(data))
+        return torch.cat(features, dim=-1)
+
     def encode(self, data):
         versions = torch.as_tensor(
             data.hierarchy_schema_version,
@@ -341,6 +469,18 @@ class CDFGHierarchical(nn.Module):
             data["function"].num_nodes,
         )
 
+        if self.hierarchy_mode == "orderless":
+            return self._encode_orderless(
+                data,
+                base,
+                edge_features,
+                static_instruction,
+                instruction_block,
+                block_function,
+                block_pragma,
+                function_pragma,
+            )
+
         max_depth = int(call_depth[reachable_functions].max().item())
         for depth in range(max_depth + 1):
             function_ids = (
@@ -381,18 +521,27 @@ class CDFGHierarchical(nn.Module):
 
             call_mask = instruction_depth[calls[0]] == depth
             depth_calls = calls[:, call_mask]
-            callee_message = _messages(
-                self.callee_proj(function_state[depth_calls[1]]),
-                torch.stack(
-                    [
-                        torch.arange(
-                            depth_calls.size(1), device=depth_calls.device
-                        ),
-                        instruction_local[depth_calls[0]],
-                    ]
-                ),
-                instruction_ids.numel(),
-            )
+            callee_source = self.callee_proj(function_state[depth_calls[1]])
+            if self.use_callee_messages:
+                callee_message = _messages(
+                    callee_source,
+                    torch.stack(
+                        [
+                            torch.arange(
+                                depth_calls.size(1), device=depth_calls.device
+                            ),
+                            instruction_local[depth_calls[0]],
+                        ]
+                    ),
+                    instruction_ids.numel(),
+                )
+            else:
+                callee_message = (
+                    callee_source.sum(dim=0, keepdim=True).expand(
+                        instruction_ids.numel(), -1
+                    )
+                    * 0
+                )
             instruction_state = self.instruction_input(
                 static_instruction[instruction_ids] + callee_message
             )
@@ -431,7 +580,7 @@ class CDFGHierarchical(nn.Module):
                 block_state = layer(
                     block_state,
                     local_cfg,
-                    use_messages=self.use_local_messages,
+                    use_messages=self.use_block_messages,
                 )
 
             block_pool = multi_pool(

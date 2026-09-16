@@ -79,6 +79,13 @@ class NoLocalMessageTests(unittest.TestCase):
 
 
 class E2ManifestValidationTests(unittest.TestCase):
+    def test_hierarchy_ablation_controls_use_all_requested_seeds(self):
+        from scripts.run_e2 import HIERARCHY_ABLATIONS, _seeds_for_control
+
+        requested = [7, 42, 137]
+        for control in HIERARCHY_ABLATIONS:
+            self.assertEqual(_seeds_for_control(control, requested), requested)
+
     def test_rejects_architecture_leakage(self):
         from scripts.run_e2 import FAMILIES, _validate_manifest
 

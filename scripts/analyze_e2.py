@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from pathlib import Path
 import sys
@@ -15,6 +16,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_REPO_ROOT / "src"))
 
 from ll_hls4ml.io.schema import LABEL_KEYS
+from ll_hls4ml.reporting.accounting import split_sha256
 
 
 def _prediction_arg(value: str) -> tuple[str, Path]:
@@ -22,6 +24,68 @@ def _prediction_arg(value: str) -> tuple[str, Path]:
     if not separator or not name or not path:
         raise argparse.ArgumentTypeError("Use NAME=/path/to/predictions.csv")
     return name, Path(path)
+
+
+def _name_value_arg(value: str) -> tuple[str, str]:
+    name, separator, item = value.partition("=")
+    if not separator or not name or not item:
+        raise argparse.ArgumentTypeError("Use NAME=VALUE")
+    return name, item
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _resolved_configs(
+    predictions: dict[str, Path],
+    *,
+    manifest_split_hash: str,
+    training_seed: int | None,
+    expected_models: dict[str, str],
+) -> tuple[dict[str, dict], int]:
+    resolved = {}
+    for name, prediction_path in predictions.items():
+        path = prediction_path.resolve().parent / "resolved_config.json"
+        if not path.is_file():
+            raise FileNotFoundError(
+                f"Prediction bundle lacks resolved_config.json: {prediction_path}"
+            )
+        config = json.loads(path.read_text())
+        if config.get("split_sha256") != manifest_split_hash:
+            raise ValueError(
+                f"Split hash mismatch for {name}: "
+                f"{config.get('split_sha256')} != {manifest_split_hash}"
+            )
+        expected_model = expected_models.get(name)
+        if expected_model is not None and config.get("model") != expected_model:
+            raise ValueError(
+                f"Model mismatch for {name}: {config.get('model')!r} "
+                f"!= {expected_model!r}"
+            )
+        resolved[name] = {
+            "path": str(path),
+            "sha256": _sha256(path),
+            "model": config.get("model"),
+            "seed": config.get("seed"),
+            "split_sha256": config.get("split_sha256"),
+            "parameter_count": config.get("parameter_count"),
+            "causal_control": config.get("causal_control"),
+            "ll_hls4ml_git": config.get("ll_hls4ml_git"),
+        }
+    seeds = {details["seed"] for details in resolved.values()}
+    if None in seeds or len(seeds) != 1:
+        raise ValueError(f"Predictions do not share one recorded training seed: {seeds}")
+    recorded_seed = int(next(iter(seeds)))
+    if training_seed is not None and recorded_seed != training_seed:
+        raise ValueError(
+            f"Recorded training seed {recorded_seed} != requested {training_seed}"
+        )
+    return resolved, recorded_seed
 
 
 def _smape_matrix(frame: pd.DataFrame) -> np.ndarray:
@@ -121,9 +185,18 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--prediction", action="append", type=_prediction_arg, required=True)
+    parser.add_argument(
+        "--expected-model", action="append", type=_name_value_arg, default=[],
+        help="Optional NAME=MODEL identity check against resolved_config.json",
+    )
     parser.add_argument("--reference", default="h0")
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--training-seed", type=int)
+    parser.add_argument("--bootstrap-seed", type=int)
+    parser.add_argument(
+        "--seed", type=int,
+        help="Deprecated alias for --bootstrap-seed",
+    )
     parser.add_argument("--replicates", type=int, default=10_000)
     args = parser.parse_args()
 
@@ -132,7 +205,27 @@ def main() -> None:
         raise ValueError("Prediction names must be unique")
     if args.reference not in predictions:
         raise ValueError(f"Reference {args.reference!r} was not supplied")
+    expected_models = dict(args.expected_model)
+    if len(expected_models) != len(args.expected_model):
+        raise ValueError("Expected-model names must be unique")
+    unknown_expected = set(expected_models) - set(predictions)
+    if unknown_expected:
+        raise ValueError(
+            f"Expected-model entries lack predictions: {sorted(unknown_expected)}"
+        )
     manifest = json.loads(args.manifest.read_text())
+    manifest_split_hash = split_sha256(manifest)
+    resolved_configs, recorded_training_seed = _resolved_configs(
+        predictions,
+        manifest_split_hash=manifest_split_hash,
+        training_seed=args.training_seed,
+        expected_models=expected_models,
+    )
+    bootstrap_seed = (
+        args.bootstrap_seed
+        if args.bootstrap_seed is not None
+        else (args.seed if args.seed is not None else 42)
+    )
     expected_by_split = {
         split: pd.DataFrame(manifest[split])[
             [
@@ -165,7 +258,7 @@ def main() -> None:
             groups = expected.loc[mask, "architecture_id"].to_numpy(str)
             low, high, fraction_nonnegative = _cluster_bootstrap(
                 values, groups,
-                seed=args.seed + 1009 * family_index,
+                seed=bootstrap_seed + 1009 * family_index,
                 replicates=args.replicates,
             )
             unique_groups, group_sizes = np.unique(groups, return_counts=True)
@@ -184,7 +277,7 @@ def main() -> None:
                 "cluster_bootstrap_ci95_high": high,
                 "bootstrap_fraction_delta_nonnegative": fraction_nonnegative,
                 "bootstrap_replicates": args.replicates,
-                "bootstrap_seed": args.seed + 1009 * family_index,
+                "bootstrap_seed": bootstrap_seed + 1009 * family_index,
                 "estimand": "sample_weighted_mean_of_six_target_smape",
                 "resampling_unit": "architecture_id",
             })
@@ -239,7 +332,7 @@ def main() -> None:
             )
             low, high, fraction_nonnegative = _cluster_bootstrap(
                 delta, groups,
-                seed=args.seed + 1009 * scope_index,
+                seed=bootstrap_seed + 1009 * scope_index,
                 replicates=args.replicates,
             )
             scope_rows.append({
@@ -262,14 +355,22 @@ def main() -> None:
     )
     provenance = {
         "manifest": str(args.manifest.resolve()),
+        "manifest_file_sha256": _sha256(args.manifest),
+        "split_sha256": manifest_split_hash,
         "predictions": {
-            name: str(path.resolve()) for name, path in predictions.items()
+            name: {
+                "path": str(path.resolve()),
+                "sha256": _sha256(path),
+            }
+            for name, path in predictions.items()
         },
+        "resolved_configs": resolved_configs,
         "reference": args.reference,
         "replicates": args.replicates,
-        "seed": args.seed,
+        "training_seed": recorded_training_seed,
+        "bootstrap_seed": bootstrap_seed,
         "interpretation": (
-            "Positive delta means the candidate is worse than H0. Confidence "
+            f"Positive delta means the candidate is worse than {args.reference}. Confidence "
             "intervals resample held-out exact architecture groups and retain all "
             "samples in each selected group. Singleton-heavy families therefore "
             "measure transfer to unseen exact architectures, not within-architecture "

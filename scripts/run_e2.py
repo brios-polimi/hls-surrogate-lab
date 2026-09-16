@@ -46,9 +46,13 @@ FAMILIES = {
     "2layer", "3layer", "conv1d", "conv2d", "dense_latency",
     "dense_resource", "rule4ml",
 }
-MODEL_ORDER = (
+DEFAULT_MODELS = (
     "fusion", "topology_destroyed", "h0", "no_local_message", "extra_trees",
 )
+HIERARCHY_ABLATIONS = (
+    "hierarchy_orderless", "no_block_cfg", "no_callee",
+)
+MODEL_ORDER = (*DEFAULT_MODELS, *HIERARCHY_ABLATIONS)
 NEURAL_MODELS = {
     "h0": ("hierarchical", "e2_h0_structural_seed{seed}"),
     "topology_destroyed": (
@@ -62,6 +66,18 @@ NEURAL_MODELS = {
     "no_local_message": (
         "hierarchical_no_local_message",
         "e2_no_local_message_structural_seed{seed}",
+    ),
+    "hierarchy_orderless": (
+        "hierarchical_orderless",
+        "e2_hierarchy_orderless_seed{seed}",
+    ),
+    "no_block_cfg": (
+        "hierarchical_no_block_cfg",
+        "e2_no_block_cfg_seed{seed}",
+    ),
+    "no_callee": (
+        "hierarchical_no_callee",
+        "e2_no_callee_seed{seed}",
     ),
 }
 
@@ -234,7 +250,52 @@ def _neural_config(
                 "global_features", "context", "heads", "optimizer", "parameters",
             ],
         }
+    elif control == "hierarchy_orderless":
+        config["causal_control"] = {
+            "version": "hierarchy_orderless_v1",
+            "role": "primary_hierarchy_ablation",
+            "removed": [
+                "instruction_to_block_containment_pooling",
+                "block_cfg_propagation",
+                "block_to_function_containment_pooling",
+                "leaf_first_call_composition",
+                "callee_state_injection",
+                "entry_reachable_function_dual_readout",
+            ],
+            "preserved": [
+                "instruction_control_def_use_messages",
+                "node_and_pragma_inputs",
+                "orderless_block_and_function_bags",
+                "global_features", "context", "heads", "optimizer",
+                "active_parameter_count",
+            ],
+        }
+    elif control == "no_block_cfg":
+        config["causal_control"] = {
+            "version": "no_block_cfg_v1",
+            "role": "secondary_mechanism_ablation",
+            "bypassed_relations": ["block/control/block"],
+            "preserved": [
+                "instruction_messages", "containment_pooling", "call_composition",
+                "global_features", "context", "heads", "optimizer", "parameters",
+            ],
+        }
+    elif control == "no_callee":
+        config["causal_control"] = {
+            "version": "no_callee_injection_v1",
+            "role": "secondary_mechanism_ablation",
+            "bypassed_relations": ["instruction/calls/function"],
+            "preserved": [
+                "instruction_messages", "block_cfg_messages", "containment_pooling",
+                "function_pooling", "global_features", "context", "heads",
+                "optimizer", "parameters",
+            ],
+        }
     return config
+
+
+def _seeds_for_control(control: str, requested: list[int]) -> list[int]:
+    return [42] if control == "no_local_message" else list(requested)
 
 
 def _materialize_jobs(args, base: dict, kernel_types: list[str], split_hash: str) -> list[Job]:
@@ -243,7 +304,7 @@ def _materialize_jobs(args, base: dict, kernel_types: list[str], split_hash: str
     slots = [device for device in args.devices for _ in range(args.jobs_per_device)]
     neural_position = 0
     for control in controls:
-        seeds = [42] if control == "no_local_message" else args.seeds
+        seeds = _seeds_for_control(control, args.seeds)
         for seed in seeds:
             experiment = (
                 f"e2_extra_trees_structural_seed{seed}"
@@ -473,7 +534,7 @@ def main() -> None:
     )
     parser.add_argument("--seeds", nargs="+", type=int, default=[7, 137])
     parser.add_argument(
-        "--models", nargs="+", choices=MODEL_ORDER, default=list(MODEL_ORDER),
+        "--models", nargs="+", choices=MODEL_ORDER, default=list(DEFAULT_MODELS),
     )
     parser.add_argument("--devices", nargs="+", default=["0"])
     parser.add_argument("--jobs-per-device", type=int, default=1)
@@ -568,6 +629,13 @@ def main() -> None:
         "replication_seeds": args.seeds,
         "no_local_message_seed": 42,
     }
+    if any(model in HIERARCHY_ABLATIONS for model in args.models):
+        metadata["hierarchy_ablation_suite"] = {
+            "version": "e2_hierarchy_ablation_v1",
+            "primary": "hierarchy_orderless",
+            "secondary": ["no_block_cfg", "no_callee"],
+            "requested_models": args.models,
+        }
     _write_stable_json(args.output_dir / "study_metadata.json", metadata)
     jobs = _materialize_jobs(args, base, kernel_types, split_hash)
     args.all_jobs = jobs

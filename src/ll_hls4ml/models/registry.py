@@ -25,6 +25,9 @@ MODELS: dict[str, type[nn.Module]] = {
     "hetero_relational": CDFGHeteroRelational,
     "hierarchical": CDFGHierarchical,
     "hierarchical_no_local_message": CDFGHierarchical,
+    "hierarchical_no_block_cfg": CDFGHierarchical,
+    "hierarchical_no_callee": CDFGHierarchical,
+    "hierarchical_orderless": CDFGHierarchical,
     "hierarchical_topology_destroyed": CDFGHierarchical,
     "hierarchical_sequence": CDFGHierarchicalSequence,
     "hierarchical_block_attention": CDFGHierarchicalBlockAttention,
@@ -49,4 +52,10 @@ def build(name: str, **kwargs) -> nn.Module:
         raise KeyError(f"Unknown model '{name}'. Available: {list_models()}")
     if name == "hierarchical_no_local_message":
         kwargs["use_local_messages"] = False
+    elif name == "hierarchical_no_block_cfg":
+        kwargs["use_block_messages"] = False
+    elif name == "hierarchical_no_callee":
+        kwargs["use_callee_messages"] = False
+    elif name == "hierarchical_orderless":
+        kwargs["hierarchy_mode"] = "orderless"
     return MODELS[name](**kwargs)
