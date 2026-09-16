@@ -66,6 +66,7 @@ PROTOCOL_ID = "e5c_late_added_honest_budget_attribution_2026_09_15"
 PARTITION_VERSION = "e5c_fixed_e5_query_nested_total_label_budget_v1"
 DEFAULT_E5_ROOT = REPO / "artifacts/results/e5_adaptation_v1"
 DEFAULT_OUTPUT = REPO / "artifacts/results/e5c_honest_budget_attribution_v1"
+LEGACY_SOURCE_ROOT = REPO / "artifacts/results/e2_replication_v1/seed42/e2_fusion_structural_seed42_batch8_legacy"
 
 BUDGETS = (4, 8, 16, 32, 64)
 PRIMARY_BUDGETS = BUDGETS
@@ -842,8 +843,9 @@ def _analyze(metadata: dict) -> None:
             all_pairs.append(paired[["architecture_id", "draw_seed", "budget", "advantage_smape"]])
             arch_effect = paired.groupby("architecture_id").advantage_smape.mean()
             ci95 = _hierarchical_effect_interval(paired, "advantage_smape", metadata["bootstrap_replicates"], _derived_seed(STUDY_ID, claim, budget, 95), 95)
-            # Bonferroni simultaneous intervals over the five registered budgets.
-            ci99 = _hierarchical_effect_interval(paired, "advantage_smape", metadata["bootstrap_replicates"], _derived_seed(STUDY_ID, claim, budget, 99), 99)
+            # Five budget-specific intervals in one claim require 99.8%
+            # per-budget coverage for a Bonferroni 99% family-wise guarantee.
+            ci99 = _hierarchical_effect_interval(paired, "advantage_smape", metadata["bootstrap_replicates"], _derived_seed(STUDY_ID, claim, budget, 99), 99.8)
             row = {"claim": claim, "budget": budget, "advantage_smape": arch_effect.mean(),
                    "ci95_low": ci95[0], "ci95_high": ci95[1], "simultaneous_ci99_low": ci99[0], "simultaneous_ci99_high": ci99[1],
                    "architecture_wins": int((arch_effect > 0).sum()), "architectures": len(arch_effect),
@@ -860,12 +862,12 @@ def _analyze(metadata: dict) -> None:
         curve_arch = curve.groupby("architecture_id").advantage_smape.mean()
         curve_ci = _hierarchical_effect_interval(
             curve, "advantage_smape", metadata["bootstrap_replicates"],
-            _derived_seed(STUDY_ID, claim, "curve"), 97.5,
+            _derived_seed(STUDY_ID, claim, "curve"), 98.75,
         )
         global_rows.append({
             "claim": claim, "estimand": "equal_weight_mean_over_k_4_8_16_32_64",
             "advantage_smape": curve_arch.mean(), "ci97_5_low": curve_ci[0],
-            "ci97_5_high": curve_ci[1],
+            "ci97_5_high": curve_ci[1], "curve_interval_coverage": 98.75,
             "architecture_wins": int((curve_arch > 0).sum()),
             "architectures": len(curve_arch), "p_value": _sign_flip_p(curve_arch.to_numpy()),
         })
@@ -918,7 +920,7 @@ def _analyze(metadata: dict) -> None:
     report = ["# E5c honest-budget representation attribution", "", "Positive advantages favor the named treatment.", "", "## Primary curve-average claims", "",
               _markdown_table(pd.DataFrame(global_rows)), "", "## Registered budget-specific contrasts", "",
               _markdown_table(pd.DataFrame(primary)), "", "## Interpretation rule", "",
-              "A strong curve-level headline requires its 97.5% hierarchical interval to exclude zero, Holm-adjusted p < 0.05 across the two claims, and at least 6/7 architecture means to agree. A budget-specific claim requires its within-claim Bonferroni 99% interval to exclude zero and at least 6/7 architecture means to agree.", ""]
+              "A strong curve-level headline requires its 97.5% family-wise hierarchical interval (98.75% per claim under Bonferroni coverage) to exclude zero, Holm-adjusted p < 0.05 across the two claims, and at least 6/7 architecture means to agree. A budget-specific claim requires its 99% family-wise interval (99.8% per budget under Bonferroni coverage) to exclude zero and at least 6/7 architecture means to agree.", ""]
     _write_stable_text(analysis / "report.md", "\n".join(report))
     _write_json_atomic(analysis / "analysis_summary.json", {
         "status": "complete",
@@ -1013,6 +1015,16 @@ def _resolve_inputs(args) -> tuple[dict, Path]:
         "vocab": _existing_or(e5["vocab"], REPO / "artifacts/vocab/vocab.json"),
         "high_level_cache": _existing_or(e5["high_level_cache"], REPO / "artifacts/cache/wa_high_level_archives1_32.pt"),
     }
+    # The original seed-42 E2 source artifacts were retained under the legacy
+    # batch-8 directory. Accept that location only as an exact-hash fallback;
+    # this prevents the active batch-16 E2 run from being substituted.
+    legacy_inputs = {
+        "source_resolved_config": LEGACY_SOURCE_ROOT / "resolved_config.json",
+        "source_checkpoint": LEGACY_SOURCE_ROOT / "checkpoints/e2_fusion_structural_seed42_checkpoint.pt",
+    }
+    for name, legacy_path in legacy_inputs.items():
+        if not inputs[name].is_file() and legacy_path.is_file():
+            inputs[name] = legacy_path.resolve()
     expected_hashes = {"source_manifest": e5["source_manifest_sha256"], "source_resolved_config": e5["source_resolved_config_sha256"],
                        "source_checkpoint": EXPECTED_SOURCE_CHECKPOINT_SHA256, "vocab": e5["vocab_sha256"], "high_level_cache": e5["high_level_cache_sha256"]}
     for name, path in inputs.items():
@@ -1054,7 +1066,7 @@ def _resolve_inputs(args) -> tuple[dict, Path]:
         "aggregation": "average initialization replicates, then support draws, then equal weight over architectures",
         "uncertainty": "hierarchical bootstrap: resample architectures, then draws within architecture",
         "primary_estimand": "equal-weight mean paired SMAPE advantage over all five log2-spaced budgets",
-        "multiplicity": "97.5% curve-average intervals and Holm-adjusted exact sign-flip tests across two claims; Bonferroni 99% intervals across five budget-specific contrasts within each claim",
+        "multiplicity": "97.5% family-wise curve-average intervals (98.75% per claim under Bonferroni) and Holm-adjusted exact sign-flip tests across two claims; 99% family-wise budget-specific intervals (99.8% per budget under Bonferroni) within each claim",
         "strong_claim_rule": "curve: adjusted interval excludes zero, Holm p<0.05, and at least 6/7 architecture means agree; pointwise: simultaneous interval excludes zero and at least 6/7 agree",
         "method_roles": {
             "identity_affine": "low-variance source-output calibration",

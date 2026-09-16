@@ -90,8 +90,9 @@ draws, then the seven architectures with equal weight.
 Each of P1 and P2 has one primary curve estimand: the equal-weight mean paired
 SMAPE advantage over all five log2-spaced budgets. Its uncertainty uses a
 hierarchical bootstrap that resamples architectures and then support draws within
-architecture. The two primary claims use 97.5% intervals and Holm-adjusted exact
-sign-flip tests over the seven architecture-level curve effects.
+architecture. The two primary claims use 98.75% per-claim intervals (97.5%
+family-wise Bonferroni coverage) and Holm-adjusted exact sign-flip tests over the
+seven architecture-level curve effects.
 
 A strong curve-level claim requires all three:
 
@@ -100,8 +101,9 @@ A strong curve-level claim requires all three:
 3. at least six of seven architecture means favor the treatment.
 
 All five budget-specific effects are also registered. Within each claim they use
-Bonferroni 99% intervals. A budget-specific headline additionally requires at
-least six of seven architecture means in the same direction. Ordinary 95%
+99.8% per-budget intervals (99% family-wise Bonferroni coverage). A
+budget-specific headline additionally requires at least six of seven architecture
+means in the same direction. Ordinary 95%
 intervals, architecture win counts, per-target metrics, and the complete raw
 prediction table are reported regardless of outcome.
 
