@@ -19,6 +19,14 @@ class OperatorLayerTests(unittest.TestCase):
         self.control = torch.tensor([[0, 1, 2, 3], [1, 2, 3, 4]])
         self.def_use = torch.tensor([[0, 0, 2], [2, 3, 4]])
         self.edge_features = torch.randn(4, 8)
+        self.pna_stats = {
+            "instruction_control_forward": 1.0,
+            "instruction_control_reverse": 1.0,
+            "instruction_def_use_forward": 1.0,
+            "instruction_def_use_reverse": 1.0,
+            "block_cfg_forward": 1.0,
+            "block_cfg_reverse": 1.0,
+        }
 
     def test_generic_forward_mean_matches_canonical_instruction_layer(self):
         canonical = InstructionFlowLayer(8, 0.0).eval()
@@ -61,8 +69,10 @@ class OperatorLayerTests(unittest.TestCase):
         for name, spec in OPERATOR_PROFILES.items():
             with self.subTest(profile=name):
                 state = self.state.detach().clone().requires_grad_(True)
-                instruction = OperatorInstructionLayer(8, 0.0, spec)
-                block = OperatorBlockLayer(8, 0.0, spec)
+                instruction = OperatorInstructionLayer(
+                    8, 0.0, spec, self.pna_stats
+                )
+                block = OperatorBlockLayer(8, 0.0, spec, self.pna_stats)
                 output = instruction(
                     state, empty, empty, empty_features
                 ) + block(state, empty)
@@ -85,6 +95,27 @@ class OperatorLayerTests(unittest.TestCase):
         forward = layer(self.state, self.control)
         reversed_edges = layer(self.state, self.control.flip(0))
         self.assertFalse(torch.allclose(forward, reversed_edges))
+
+    def test_pna_uses_degree_scaled_multi_aggregation(self):
+        layer = OperatorInstructionLayer(
+            8, 0.0, operator_spec("pna"), self.pna_stats
+        ).eval()
+        output = layer(
+            self.state,
+            self.control,
+            self.def_use,
+            self.edge_features,
+        )
+        self.assertEqual(output.shape, self.state.shape)
+        self.assertTrue(torch.isfinite(output).all())
+        output.sum().backward()
+        pna_parameters = [
+            parameter
+            for name, parameter in layer.named_parameters()
+            if "pna_correction" in name
+        ]
+        self.assertTrue(pna_parameters)
+        self.assertTrue(all(parameter.grad is not None for parameter in pna_parameters))
 
 
 class OperatorModelTests(unittest.TestCase):

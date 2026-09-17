@@ -7,7 +7,9 @@ import torch.nn as nn
 from ll_hls4ml.models.hetero_gat import CDFGHeteroGAT
 from ll_hls4ml.models.hetero_relational import CDFGHeteroRelational
 from ll_hls4ml.models.hierarchical import CDFGHierarchical
+from ll_hls4ml.models.hierarchical_attention import CDFGHierarchicalAttention
 from ll_hls4ml.models.hierarchical_operators import CDFGHierarchicalOperator
+from ll_hls4ml.models.hierarchical_variables import CDFGHierarchicalVariableRoute
 from ll_hls4ml.models.hierarchical_experimental import (
     CDFGHierarchicalBlockAttention,
     CDFGHierarchicalMemoryDual,
@@ -25,7 +27,9 @@ MODELS: dict[str, type[nn.Module]] = {
     "hetero_gat": CDFGHeteroGAT,
     "hetero_relational": CDFGHeteroRelational,
     "hierarchical": CDFGHierarchical,
+    "hierarchical_attention": CDFGHierarchicalAttention,
     "hierarchical_operator": CDFGHierarchicalOperator,
+    "hierarchical_variable_route": CDFGHierarchicalVariableRoute,
     "hierarchical_no_local_message": CDFGHierarchical,
     "hierarchical_no_block_cfg": CDFGHierarchical,
     "hierarchical_no_callee": CDFGHierarchical,

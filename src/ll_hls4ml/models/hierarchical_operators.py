@@ -26,14 +26,17 @@ class OperatorSpec:
     aggregation: str = "mean"
     relation_mixer: str = "sum"
     update: str = "residual"
+    rank: int | None = 8
 
     def validate(self) -> None:
-        if self.aggregation not in {"mean", "mean_max"}:
+        if self.aggregation not in {"mean", "mean_max", "pna"}:
             raise ValueError(f"Unsupported aggregation: {self.aggregation}")
         if self.relation_mixer not in {"sum", "concat"}:
             raise ValueError(f"Unsupported relation mixer: {self.relation_mixer}")
         if self.update not in {"residual", "gru"}:
             raise ValueError(f"Unsupported update: {self.update}")
+        if self.rank is not None and self.rank < 1:
+            raise ValueError("Operator rank must be positive or None for full width")
 
 
 OPERATOR_PROFILES: dict[str, OperatorSpec] = {
@@ -60,6 +63,41 @@ OPERATOR_PROFILES: dict[str, OperatorSpec] = {
         aggregation="mean_max",
         update="gru",
     ),
+    "pna": OperatorSpec(aggregation="pna"),
+    "pna_gate_bidir": OperatorSpec(
+        receiver_gate=True,
+        bidirectional=True,
+        aggregation="pna",
+    ),
+    # Capacity-seeking track. ``rank=None`` uses full-width linear maps and a
+    # standard GRUCell instead of the rank-8 mechanism probes above.
+    "wide_receiver_gate": OperatorSpec(receiver_gate=True, rank=None),
+    "wide_gate_bidir": OperatorSpec(
+        receiver_gate=True,
+        bidirectional=True,
+        rank=None,
+    ),
+    "wide_gate_bidir_meanmax": OperatorSpec(
+        receiver_gate=True,
+        bidirectional=True,
+        aggregation="mean_max",
+        rank=None,
+    ),
+    "wide_full_operator": OperatorSpec(
+        receiver_gate=True,
+        bidirectional=True,
+        aggregation="mean_max",
+        update="gru",
+        rank=None,
+    ),
+    "pna_wide": OperatorSpec(aggregation="pna", rank=None),
+    "pna_wide_full": OperatorSpec(
+        receiver_gate=True,
+        bidirectional=True,
+        aggregation="pna",
+        update="gru",
+        rank=None,
+    ),
 }
 
 
@@ -78,9 +116,15 @@ def operator_spec(name: str) -> OperatorSpec:
 class _FlowBranch(nn.Module):
     """One directed, relation-specific message flow."""
 
-    def __init__(self, hidden_dim: int, spec: OperatorSpec, rank: int = 8):
+    def __init__(
+        self,
+        hidden_dim: int,
+        spec: OperatorSpec,
+        pna_avg_log_degree: tuple[float, float] | None = None,
+    ):
         super().__init__()
         self.spec = spec
+        rank = spec.rank
         self.source = nn.Linear(hidden_dim, hidden_dim, bias=False)
         self.aggregate_correction = (
             _LowRankProjection(
@@ -89,6 +133,22 @@ class _FlowBranch(nn.Module):
             if spec.aggregation == "mean_max"
             else None
         )
+        self.pna_correction = (
+            _LowRankProjection(
+                12 * hidden_dim, hidden_dim, rank, output_bias=False
+            )
+            if spec.aggregation == "pna"
+            else None
+        )
+        if spec.aggregation == "pna":
+            if pna_avg_log_degree is None:
+                raise ValueError("PNA aggregation requires forward/reverse degree statistics")
+            self.register_buffer(
+                "pna_avg_log_degree",
+                torch.tensor(pna_avg_log_degree, dtype=torch.float32),
+            )
+        else:
+            self.register_buffer("pna_avg_log_degree", None)
         self.gate = (
             _LowRankProjection(2 * hidden_dim, hidden_dim, rank)
             if spec.receiver_gate
@@ -140,11 +200,50 @@ class _FlowBranch(nn.Module):
                 dim_size=state.size(0),
                 reduce="max",
             )
+            minimum = scatter(
+                values,
+                target_index,
+                dim=0,
+                dim_size=state.size(0),
+                reduce="min",
+            )
+            mean_square = scatter(
+                values.square(),
+                target_index,
+                dim=0,
+                dim_size=state.size(0),
+                reduce="mean",
+            )
+            standard_deviation = (
+                mean_square - mean.square()
+            ).clamp_min(0).add(1e-6).sqrt()
+        if edge_index.numel() == 0:
+            minimum = mean
+            standard_deviation = mean
         message = mean
         if self.aggregate_correction is not None:
             message = message + self.aggregate_correction(
                 torch.cat([mean, maximum], dim=-1)
             )
+        if self.pna_correction is not None:
+            degree = torch.bincount(
+                target_index, minlength=state.size(0)
+            ).to(dtype=state.dtype, device=state.device)
+            log_degree = torch.log1p(degree).unsqueeze(-1)
+            average = self.pna_avg_log_degree[1 if reverse else 0].to(
+                dtype=state.dtype, device=state.device
+            ).clamp_min(1e-3)
+            amplification = log_degree / average
+            attenuation = average / log_degree.clamp_min(1e-3)
+            aggregators = torch.cat(
+                [mean, maximum, minimum, standard_deviation], dim=-1
+            )
+            aggregators = aggregators * (degree > 0).unsqueeze(-1)
+            scaled = torch.cat(
+                [aggregators, aggregators * amplification, aggregators * attenuation],
+                dim=-1,
+            )
+            message = message + self.pna_correction(scaled)
         if self.gate is not None:
             message = message * torch.sigmoid(
                 self.gate(torch.cat([state, message], dim=-1))
@@ -153,20 +252,35 @@ class _FlowBranch(nn.Module):
 
 
 class _LowRankProjection(nn.Module):
-    """Nonlinear low-rank map used to limit capacity confounding."""
+    """Low-rank nonlinear map, or one full-width linear map when rank is None."""
 
     def __init__(
         self,
         input_dim: int,
         output_dim: int,
-        rank: int = 8,
+        rank: int | None = 8,
         output_bias: bool = True,
     ):
         super().__init__()
-        self.down = nn.Linear(input_dim, rank, bias=False)
-        self.up = nn.Linear(rank, output_dim, bias=output_bias)
+        self.direct = (
+            nn.Linear(input_dim, output_dim, bias=output_bias)
+            if rank is None
+            else None
+        )
+        self.down = (
+            nn.Linear(input_dim, rank, bias=False)
+            if rank is not None
+            else None
+        )
+        self.up = (
+            nn.Linear(rank, output_dim, bias=output_bias)
+            if rank is not None
+            else None
+        )
 
     def forward(self, value: torch.Tensor) -> torch.Tensor:
+        if self.direct is not None:
+            return self.direct(value)
         return self.up(F.gelu(self.down(value)))
 
 
@@ -198,7 +312,7 @@ class _OperatorUpdate(nn.Module):
         flow_count: int,
         spec: OperatorSpec,
         dropout: float,
-        rank: int = 8,
+        rank: int | None = 8,
     ):
         super().__init__()
         self.spec = spec
@@ -212,11 +326,13 @@ class _OperatorUpdate(nn.Module):
             if spec.relation_mixer == "concat" and flow_count > 1
             else None
         )
-        self.gru = (
-            _LowRankGRUUpdate(hidden_dim, rank)
-            if spec.update == "gru"
-            else None
-        )
+        self.gru = None
+        if spec.update == "gru":
+            self.gru = (
+                nn.GRUCell(hidden_dim, hidden_dim)
+                if rank is None
+                else _LowRankGRUUpdate(hidden_dim, rank)
+            )
         self.norm = nn.LayerNorm(hidden_dim)
         self.dropout = nn.Dropout(dropout)
 
@@ -233,16 +349,39 @@ class _OperatorUpdate(nn.Module):
 class OperatorInstructionLayer(nn.Module):
     """Relation-specific instruction flows with configurable update axes."""
 
-    def __init__(self, hidden_dim: int, dropout: float, spec: OperatorSpec):
+    def __init__(
+        self,
+        hidden_dim: int,
+        dropout: float,
+        spec: OperatorSpec,
+        pna_avg_log_degrees: dict[str, float] | None = None,
+    ):
         super().__init__()
         self.spec = spec
-        self.control_forward = _FlowBranch(hidden_dim, spec)
-        self.def_use_forward = _FlowBranch(hidden_dim, spec)
+        rank = spec.rank
+        pna = pna_avg_log_degrees or {}
+        self.control_forward = _FlowBranch(
+            hidden_dim,
+            spec,
+            (
+                pna.get("instruction_control_forward"),
+                pna.get("instruction_control_reverse"),
+            ) if spec.aggregation == "pna" else None,
+        )
+        self.def_use_forward = _FlowBranch(
+            hidden_dim,
+            spec,
+            (
+                pna.get("instruction_def_use_forward"),
+                pna.get("instruction_def_use_reverse"),
+            ) if spec.aggregation == "pna" else None,
+        )
         self.update = _OperatorUpdate(
             hidden_dim,
             flow_count=4 if spec.bidirectional else 2,
             spec=spec,
             dropout=dropout,
+            rank=rank,
         )
 
     def forward(
@@ -274,15 +413,31 @@ class OperatorInstructionLayer(nn.Module):
 class OperatorBlockLayer(nn.Module):
     """Configurable predecessor/successor flow on the block CFG."""
 
-    def __init__(self, hidden_dim: int, dropout: float, spec: OperatorSpec):
+    def __init__(
+        self,
+        hidden_dim: int,
+        dropout: float,
+        spec: OperatorSpec,
+        pna_avg_log_degrees: dict[str, float] | None = None,
+    ):
         super().__init__()
         self.spec = spec
-        self.forward_flow = _FlowBranch(hidden_dim, spec)
+        rank = spec.rank
+        pna = pna_avg_log_degrees or {}
+        self.forward_flow = _FlowBranch(
+            hidden_dim,
+            spec,
+            (
+                pna.get("block_cfg_forward"),
+                pna.get("block_cfg_reverse"),
+            ) if spec.aggregation == "pna" else None,
+        )
         self.update = _OperatorUpdate(
             hidden_dim,
             flow_count=2 if spec.bidirectional else 1,
             spec=spec,
             dropout=dropout,
+            rank=rank,
         )
 
     def forward(
@@ -302,7 +457,13 @@ class OperatorBlockLayer(nn.Module):
 class CDFGHierarchicalOperator(CDFGHierarchical):
     """Canonical hierarchy with only its local operators replaced."""
 
-    def __init__(self, *args, operator_profile: str, **kwargs):
+    def __init__(
+        self,
+        *args,
+        operator_profile: str,
+        pna_avg_log_degrees: dict[str, float] | None = None,
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
         spec = operator_spec(operator_profile)
         instruction_count = len(self.instruction_layers)
@@ -314,10 +475,12 @@ class CDFGHierarchicalOperator(CDFGHierarchical):
         self.operator_profile = operator_profile
         self.operator_spec = asdict(spec)
         self.instruction_layers = nn.ModuleList(
-            OperatorInstructionLayer(hidden_dim, dropout, spec)
+            OperatorInstructionLayer(
+                hidden_dim, dropout, spec, pna_avg_log_degrees
+            )
             for _ in range(instruction_count)
         )
         self.block_layers = nn.ModuleList(
-            OperatorBlockLayer(hidden_dim, dropout, spec)
+            OperatorBlockLayer(hidden_dim, dropout, spec, pna_avg_log_degrees)
             for _ in range(block_count)
         )

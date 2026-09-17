@@ -280,6 +280,36 @@ class CDFGHierarchical(nn.Module):
             device=data[node_type].x.device,
         )
 
+    def _refine_instruction_state(
+        self,
+        state: torch.Tensor,
+        instruction_block: torch.Tensor,
+        block_count: int,
+    ) -> torch.Tensor:
+        """Optional within-block composition hook; canonical is identity."""
+        return state
+
+    def _exchange_variable_state(
+        self,
+        state: torch.Tensor,
+        variable_state: torch.Tensor,
+        data,
+        instruction_ids: torch.Tensor,
+        instruction_local: torch.Tensor,
+        operand_edge_features: torch.Tensor,
+    ) -> torch.Tensor:
+        """Optional first-class variable route; canonical is identity."""
+        return state
+
+    def _refine_block_state(
+        self,
+        state: torch.Tensor,
+        block_function: torch.Tensor,
+        function_count: int,
+    ) -> torch.Tensor:
+        """Optional within-function composition hook; canonical is identity."""
+        return state
+
     def _encode_orderless(
         self,
         data,
@@ -558,6 +588,20 @@ class CDFGHierarchical(nn.Module):
                     use_messages=self.use_local_messages,
                 )
 
+            instruction_state = self._exchange_variable_state(
+                instruction_state,
+                variable,
+                data,
+                instruction_ids,
+                instruction_local,
+                edge_features[variable_operand],
+            )
+            instruction_state = self._refine_instruction_state(
+                instruction_state,
+                block_local[instruction_block[instruction_ids]],
+                block_ids.numel(),
+            )
+
             instruction_pool = multi_pool(
                 instruction_state,
                 block_local[instruction_block[instruction_ids]],
@@ -582,6 +626,12 @@ class CDFGHierarchical(nn.Module):
                     local_cfg,
                     use_messages=self.use_block_messages,
                 )
+
+            block_state = self._refine_block_state(
+                block_state,
+                function_local[block_function[block_ids]],
+                function_ids.numel(),
+            )
 
             block_pool = multi_pool(
                 block_state,

@@ -126,7 +126,9 @@ def _model_from_config(config: dict, vocab_size: int, max_pos: int, train_ds):
     }
     hierarchical_models = {
         "hierarchical",
+        "hierarchical_attention",
         "hierarchical_operator",
+        "hierarchical_variable_route",
         "hierarchical_no_local_message",
         "hierarchical_no_block_cfg",
         "hierarchical_no_callee",
@@ -192,7 +194,9 @@ def _model_from_config(config: dict, vocab_size: int, max_pos: int, train_ds):
         "hetero_gat",
         "hetero_relational",
         "hierarchical",
+        "hierarchical_attention",
         "hierarchical_operator",
+        "hierarchical_variable_route",
         "hierarchical_no_local_message",
         "hierarchical_no_block_cfg",
         "hierarchical_no_callee",
@@ -226,8 +230,36 @@ def _model_from_config(config: dict, vocab_size: int, max_pos: int, train_ds):
                 "instruction_num_layers"
             )
             common["block_num_layers"] = config.get("block_num_layers")
-            if model_name == "hierarchical_operator":
+            if model_name in {
+                "hierarchical_operator",
+                "hierarchical_attention",
+                "hierarchical_variable_route",
+            }:
                 common["operator_profile"] = config.get("operator_profile")
+                common["pna_avg_log_degrees"] = config.get(
+                    "pna_avg_log_degrees"
+                )
+            if model_name == "hierarchical_attention":
+                common.update(
+                    {
+                        "attention_scope": config.get("attention_scope"),
+                        "attention_heads": config.get("attention_heads", 4),
+                        "attention_layers": config.get("attention_layers", 2),
+                        "attention_feedforward_multiplier": config.get(
+                            "attention_feedforward_multiplier", 4
+                        ),
+                        "attention_pair_budget": config.get(
+                            "attention_pair_budget", 131_072
+                        ),
+                    }
+                )
+            if model_name == "hierarchical_variable_route":
+                common.update(
+                    {
+                        "variable_route": config.get("variable_route"),
+                        "variable_rounds": config.get("variable_rounds", 1),
+                    }
+                )
             if model_name in {
                 "hierarchical_sequence",
                 "hierarchical_block_attention",
