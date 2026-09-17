@@ -81,9 +81,14 @@ split hash, and sibling resolved configurations before computing contrasts.
 
 The durable headline table is `analysis/seed_specific_hierarchy_contrasts.csv`.
 `analysis/cross_seed_descriptive.csv` contains only descriptive aggregation.
-Each seed directory contains family- and target-scope diagnostics plus hashes
-of the exact prediction and configuration files used. The suite analysis also
-refuses to compare a run when its recorded parameter count differs from H0.
+`seed_specific_family_contrasts.csv` and
+`seed_specific_scope_contrasts.csv` retain all test and exemplar diagnostics;
+their `cross_seed_*_descriptive.csv` counterparts summarize, but do not infer
+over, the three training seeds. `training_diagnostics.csv` records stopping,
+validation, runtime, and memory information. Each seed directory contains the
+underlying cohort-level tables plus hashes of the exact prediction and
+configuration files used. The suite analysis also refuses to compare a run
+when its recorded parameter count differs from H0.
 
 After results exist, the implementation chapter needs the registered orderless,
 no-block-CFG, and no-callee definitions; the methodology chapter needs the

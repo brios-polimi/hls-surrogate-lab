@@ -240,50 +240,58 @@ def main() -> None:
         for name, path in predictions.items()
         for split in ("test", "exemplar")
     }
-    expected = expected_by_split["test"]
-    frames = {name: validated[(name, "test")] for name in predictions}
-    errors = {name: _smape(frame) for name, frame in frames.items()}
-    reference = errors[args.reference]
     rows = []
-    families = ["all", *sorted(expected["kernel_family"].unique())]
-    for candidate, candidate_errors in errors.items():
-        if candidate == args.reference:
-            continue
-        delta = candidate_errors - reference
-        for family_index, family in enumerate(families):
-            mask = np.ones(len(expected), dtype=bool) if family == "all" else (
-                expected["kernel_family"].to_numpy(str) == family
-            )
-            values = delta[mask]
-            groups = expected.loc[mask, "architecture_id"].to_numpy(str)
-            low, high, fraction_nonnegative = _cluster_bootstrap(
-                values, groups,
-                seed=bootstrap_seed + 1009 * family_index,
-                replicates=args.replicates,
-            )
-            unique_groups, group_sizes = np.unique(groups, return_counts=True)
-            rows.append({
-                "candidate": candidate,
-                "reference": args.reference,
-                "split": "test",
-                "kernel_family": family,
-                "n_samples": int(mask.sum()),
-                "n_architecture_groups": len(unique_groups),
-                "singleton_group_fraction": float(np.mean(group_sizes == 1)),
-                "reference_macro_smape": float(reference[mask].mean()),
-                "candidate_macro_smape": float(candidate_errors[mask].mean()),
-                "delta_macro_smape_candidate_minus_reference": float(values.mean()),
-                "cluster_bootstrap_ci95_low": low,
-                "cluster_bootstrap_ci95_high": high,
-                "bootstrap_fraction_delta_nonnegative": fraction_nonnegative,
-                "bootstrap_replicates": args.replicates,
-                "bootstrap_seed": bootstrap_seed + 1009 * family_index,
-                "estimand": "sample_weighted_mean_of_six_target_smape",
-                "resampling_unit": "architecture_id",
-            })
+    for split_index, split in enumerate(("test", "exemplar")):
+        expected = expected_by_split[split]
+        frames = {name: validated[(name, split)] for name in predictions}
+        errors = {name: _smape(prediction) for name, prediction in frames.items()}
+        reference = errors[args.reference]
+        families = ["all", *sorted(expected["kernel_family"].unique())]
+        for candidate, candidate_errors in errors.items():
+            if candidate == args.reference:
+                continue
+            delta = candidate_errors - reference
+            for family_index, family in enumerate(families):
+                mask = (
+                    np.ones(len(expected), dtype=bool)
+                    if family == "all"
+                    else expected["kernel_family"].to_numpy(str) == family
+                )
+                values = delta[mask]
+                groups = expected.loc[mask, "architecture_id"].to_numpy(str)
+                resample_seed = (
+                    bootstrap_seed + 100_003 * split_index + 1009 * family_index
+                )
+                low, high, fraction_nonnegative = _cluster_bootstrap(
+                    values, groups,
+                    seed=resample_seed,
+                    replicates=args.replicates,
+                )
+                unique_groups, group_sizes = np.unique(groups, return_counts=True)
+                rows.append({
+                    "candidate": candidate,
+                    "reference": args.reference,
+                    "split": split,
+                    "kernel_family": family,
+                    "n_samples": int(mask.sum()),
+                    "n_architecture_groups": len(unique_groups),
+                    "singleton_group_fraction": float(np.mean(group_sizes == 1)),
+                    "reference_macro_smape": float(reference[mask].mean()),
+                    "candidate_macro_smape": float(candidate_errors[mask].mean()),
+                    "delta_macro_smape_candidate_minus_reference": float(values.mean()),
+                    "cluster_bootstrap_ci95_low": low,
+                    "cluster_bootstrap_ci95_high": high,
+                    "bootstrap_fraction_delta_nonnegative": fraction_nonnegative,
+                    "bootstrap_replicates": args.replicates,
+                    "bootstrap_seed": resample_seed,
+                    "estimand": "sample_weighted_mean_of_six_target_smape",
+                    "resampling_unit": "architecture_id",
+                })
     output = args.output_dir
     output.mkdir(parents=True, exist_ok=True)
-    frame = pd.DataFrame(rows)
+    cohort_frame = pd.DataFrame(rows)
+    cohort_frame.to_csv(output / "cohort_cluster_bootstrap.csv", index=False)
+    frame = cohort_frame[cohort_frame["split"] == "test"].copy()
     frame.to_csv(output / "architecture_cluster_bootstrap.csv", index=False)
 
     metric_rows = []
@@ -319,38 +327,49 @@ def main() -> None:
     pd.DataFrame(metric_rows).to_csv(output / "model_metrics.csv", index=False)
 
     scope_rows = []
-    reference_matrix = _smape_matrix(frames[args.reference])
-    groups = expected["architecture_id"].to_numpy(str)
-    for candidate, candidate_frame in frames.items():
-        if candidate == args.reference:
-            continue
-        candidate_matrix = _smape_matrix(candidate_frame)
-        for scope_index, (scope, positions) in enumerate(positions_by_scope.items()):
-            delta = (
-                candidate_matrix[:, positions].mean(axis=1)
-                - reference_matrix[:, positions].mean(axis=1)
-            )
-            low, high, fraction_nonnegative = _cluster_bootstrap(
-                delta, groups,
-                seed=bootstrap_seed + 1009 * scope_index,
-                replicates=args.replicates,
-            )
-            scope_rows.append({
-                "candidate": candidate,
-                "reference": args.reference,
-                "split": "test",
-                "scope": scope,
-                "n_samples": len(delta),
-                "n_architecture_groups": len(np.unique(groups)),
-                "delta_macro_smape_candidate_minus_reference": float(delta.mean()),
-                "cluster_bootstrap_ci95_low": low,
-                "cluster_bootstrap_ci95_high": high,
-                "bootstrap_fraction_delta_nonnegative": fraction_nonnegative,
-                "candidate_win_fraction": float(np.mean(delta < 0)),
-                "bootstrap_replicates": args.replicates,
-                "resampling_unit": "architecture_id",
-            })
-    pd.DataFrame(scope_rows).to_csv(
+    for split_index, split in enumerate(("test", "exemplar")):
+        expected = expected_by_split[split]
+        frames = {name: validated[(name, split)] for name in predictions}
+        reference_matrix = _smape_matrix(frames[args.reference])
+        groups = expected["architecture_id"].to_numpy(str)
+        for candidate, candidate_frame in frames.items():
+            if candidate == args.reference:
+                continue
+            candidate_matrix = _smape_matrix(candidate_frame)
+            for scope_index, (scope, positions) in enumerate(positions_by_scope.items()):
+                delta = (
+                    candidate_matrix[:, positions].mean(axis=1)
+                    - reference_matrix[:, positions].mean(axis=1)
+                )
+                resample_seed = (
+                    bootstrap_seed + 100_003 * split_index + 1009 * scope_index
+                )
+                low, high, fraction_nonnegative = _cluster_bootstrap(
+                    delta, groups,
+                    seed=resample_seed,
+                    replicates=args.replicates,
+                )
+                scope_rows.append({
+                    "candidate": candidate,
+                    "reference": args.reference,
+                    "split": split,
+                    "scope": scope,
+                    "n_samples": len(delta),
+                    "n_architecture_groups": len(np.unique(groups)),
+                    "delta_macro_smape_candidate_minus_reference": float(delta.mean()),
+                    "cluster_bootstrap_ci95_low": low,
+                    "cluster_bootstrap_ci95_high": high,
+                    "bootstrap_fraction_delta_nonnegative": fraction_nonnegative,
+                    "candidate_win_fraction": float(np.mean(delta < 0)),
+                    "bootstrap_replicates": args.replicates,
+                    "bootstrap_seed": resample_seed,
+                    "resampling_unit": "architecture_id",
+                })
+    cohort_scope_frame = pd.DataFrame(scope_rows)
+    cohort_scope_frame.to_csv(
+        output / "cohort_scope_cluster_bootstrap.csv", index=False
+    )
+    cohort_scope_frame[cohort_scope_frame["split"] == "test"].to_csv(
         output / "scope_cluster_bootstrap.csv", index=False
     )
     provenance = {

@@ -33,6 +33,29 @@ def _prediction_path(results_dir: Path, control: str, seed: int) -> Path:
     return results_dir / f"seed{seed}" / experiment / "predictions.csv"
 
 
+def _cross_seed_descriptive(
+    frame: pd.DataFrame, group_columns: list[str],
+) -> pd.DataFrame:
+    return (
+        frame.groupby(group_columns, as_index=False)
+        .agg(
+            seeds=("training_seed", "count"),
+            delta_smape_mean=("delta_macro_smape_candidate_minus_reference", "mean"),
+            delta_smape_std=("delta_macro_smape_candidate_minus_reference", "std"),
+            delta_smape_min=("delta_macro_smape_candidate_minus_reference", "min"),
+            delta_smape_max=("delta_macro_smape_candidate_minus_reference", "max"),
+            intervals_above_zero=(
+                "cluster_bootstrap_ci95_low",
+                lambda values: int((values > 0).sum()),
+            ),
+            intervals_below_zero=(
+                "cluster_bootstrap_ci95_high",
+                lambda values: int((values < 0).sum()),
+            ),
+        )
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest", type=Path, required=True)
@@ -73,7 +96,10 @@ def main() -> None:
         raise FileNotFoundError(manifest)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    combined_rows = []
+    family_rows = []
+    scope_rows = []
+    metric_rows = []
+    training_rows = []
     commands = []
     parameter_counts = {}
     analyzer = _REPO_ROOT / "scripts" / "analyze_e2.py"
@@ -126,26 +152,78 @@ def main() -> None:
                 f"Seed {seed} parameter-count mismatch against H0: {seed_counts}"
             )
         parameter_counts[str(seed)] = seed_counts
-        frame = pd.read_csv(seed_output / "architecture_cluster_bootstrap.csv")
-        frame = frame[frame["kernel_family"] == "all"].copy()
-        frame.insert(0, "training_seed", seed)
-        combined_rows.append(frame)
+        family_frame = pd.read_csv(seed_output / "cohort_cluster_bootstrap.csv")
+        family_frame.insert(0, "training_seed", seed)
+        family_rows.append(family_frame)
+        scope_frame = pd.read_csv(
+            seed_output / "cohort_scope_cluster_bootstrap.csv"
+        )
+        scope_frame.insert(0, "training_seed", seed)
+        scope_rows.append(scope_frame)
+        metric_frame = pd.read_csv(seed_output / "model_metrics.csv")
+        metric_frame.insert(0, "training_seed", seed)
+        metric_rows.append(metric_frame)
+        for control in args.controls:
+            run_dir = _prediction_path(results_dir, control, seed).parent
+            summary = json.loads((run_dir / "summary.json").read_text())
+            config = summary["resolved_config"]
+            curve = pd.read_csv(run_dir / "learning_curves.csv")
+            training_rows.append({
+                "training_seed": seed,
+                "control": control,
+                "model": config["model"],
+                "parameter_count": config["parameter_count"],
+                "epochs_ran": int(curve["epoch"].max()) + 1,
+                "best_epoch": int(summary["best_epoch"]),
+                "best_validation_smape": float(summary["best_metric"]),
+                "stop_reason": config.get("stop_reason"),
+                "training_hours": float(config["cumulative_training_seconds"]) / 3600,
+                "wall_hours": float(config["wall_seconds"]) / 3600,
+                "peak_gpu_memory_mb": float(config["peak_gpu_memory_mb"]),
+            })
 
-    combined = pd.concat(combined_rows, ignore_index=True)
+    family_frame = pd.concat(family_rows, ignore_index=True)
+    family_frame.to_csv(
+        output_dir / "seed_specific_family_contrasts.csv", index=False
+    )
+    combined = family_frame[
+        (family_frame["split"] == "test")
+        & (family_frame["kernel_family"] == "all")
+    ].copy()
     combined.to_csv(output_dir / "seed_specific_hierarchy_contrasts.csv", index=False)
-    descriptive = (
-        combined.groupby(["candidate", "reference"], as_index=False)
+    scope_frame = pd.concat(scope_rows, ignore_index=True)
+    scope_frame.to_csv(
+        output_dir / "seed_specific_scope_contrasts.csv", index=False
+    )
+    pd.concat(metric_rows, ignore_index=True).to_csv(
+        output_dir / "seed_specific_model_metrics.csv", index=False
+    )
+    pd.DataFrame(training_rows).to_csv(
+        output_dir / "training_diagnostics.csv", index=False
+    )
+    descriptive = _cross_seed_descriptive(
+        combined, ["candidate", "reference", "split"]
+    )
+    score_means = (
+        combined.groupby(["candidate", "reference", "split"], as_index=False)
         .agg(
-            seeds=("training_seed", "count"),
             reference_smape_mean=("reference_macro_smape", "mean"),
             candidate_smape_mean=("candidate_macro_smape", "mean"),
-            delta_smape_mean=("delta_macro_smape_candidate_minus_reference", "mean"),
-            delta_smape_std=("delta_macro_smape_candidate_minus_reference", "std"),
-            delta_smape_min=("delta_macro_smape_candidate_minus_reference", "min"),
-            delta_smape_max=("delta_macro_smape_candidate_minus_reference", "max"),
         )
     )
+    descriptive = descriptive.merge(
+        score_means, on=["candidate", "reference", "split"],
+        validate="one_to_one",
+    )
     descriptive.to_csv(output_dir / "cross_seed_descriptive.csv", index=False)
+    _cross_seed_descriptive(
+        family_frame,
+        ["candidate", "reference", "split", "kernel_family"],
+    ).to_csv(output_dir / "cross_seed_family_descriptive.csv", index=False)
+    _cross_seed_descriptive(
+        scope_frame,
+        ["candidate", "reference", "split", "scope"],
+    ).to_csv(output_dir / "cross_seed_scope_descriptive.csv", index=False)
     provenance = {
         "study": "e2_hierarchy_ablation_v1",
         "manifest": str(manifest),
