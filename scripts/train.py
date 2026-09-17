@@ -126,6 +126,7 @@ def _model_from_config(config: dict, vocab_size: int, max_pos: int, train_ds):
     }
     hierarchical_models = {
         "hierarchical",
+        "hierarchical_operator",
         "hierarchical_no_local_message",
         "hierarchical_no_block_cfg",
         "hierarchical_no_callee",
@@ -191,6 +192,7 @@ def _model_from_config(config: dict, vocab_size: int, max_pos: int, train_ds):
         "hetero_gat",
         "hetero_relational",
         "hierarchical",
+        "hierarchical_operator",
         "hierarchical_no_local_message",
         "hierarchical_no_block_cfg",
         "hierarchical_no_callee",
@@ -224,6 +226,8 @@ def _model_from_config(config: dict, vocab_size: int, max_pos: int, train_ds):
                 "instruction_num_layers"
             )
             common["block_num_layers"] = config.get("block_num_layers")
+            if model_name == "hierarchical_operator":
+                common["operator_profile"] = config.get("operator_profile")
             if model_name in {
                 "hierarchical_sequence",
                 "hierarchical_block_attention",
