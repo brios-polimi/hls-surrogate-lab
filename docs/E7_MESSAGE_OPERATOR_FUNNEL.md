@@ -77,7 +77,20 @@ already present in the frozen tensors.
 | `attn_dual` | both containment scales | canonical-equivalent forward mean | 456,400 |
 | `attn_dual_wide_operator` | both containment scales | `wide_full_operator` | 755,344 |
 
+Sparse edge attention is a separate local-message family. It normalizes
+multi-head query/key scores only over incoming neighbors, keeps control and
+def-use parameters separate, and uses embedded control-edge positions in keys
+and values. It therefore tests learned neighbor weighting without allowing
+all instructions in a block to communicate directly.
+
+| ID | Sparse attention flow | E2 parameters |
+|---|---|---:|
+| `edge_attention` | forward control, def-use, and block-CFG edges | 387,152 |
+| `edge_attention_bidir` | independent forward/reverse parameters for every flow | 571,472 |
+
 These are hierarchy/composition experiments, not message-operator mechanisms.
+The attention stack is applied once as a post-message refiner at its selected
+containment scale; it is not interleaved with every local propagation layer.
 The old sequence, block-attention, and memory-dual runs neither promote nor
 eliminate them because those probes changed several mechanisms and used a
 different split and training contract. Unrestricted attention over every
@@ -107,8 +120,34 @@ features into instruction inputs or using the derived instruction def-use edge.
 Variable nodes have no explicit call-depth field. The implementation therefore
 selects them only through edges incident to the current depth's instructions;
 it does not invent ownership or mutate the tensor contract.
+The canonical static variable-to-instruction input remains present, so this
+track estimates the value of adding recurrent first-class state, not replacing
+or proving the insufficiency of static variable ingestion.
 
 ## Funnel
+
+### Scheduling tiers
+
+Do not launch the entire catalog as one batch. The recommended diverse first
+wave is the named `core` set: `receiver_gate`, `bidirectional`, `gate_bidir`,
+`pna`, `pna_gate_bidir`, `wide_full_operator`, `edge_attention`, the three
+instruction/block/dual containment-attention cells, and `variable_route_all`.
+This is 11 candidates (22 screen fits), spanning five genuinely different
+inductive biases rather than spending most compute on nearby width choices.
+
+The remaining 14 are conditional ladder cells:
+
+- Run `edge_attention_bidir` only if sparse attention is competitive.
+- Run memory-only, two-round, or wide variable routes only if the basic
+  first-class route is competitive or reveals a target-specific signal.
+- Run the remaining mean/max, GRU, and wide local operators to localize a win
+  in their parent gate/bidirectional/PNA family.
+- Run `attn_dual_wide_operator` only if either dense containment attention or
+  the wide local operator earns the extra capacity comparison.
+
+The catalog is intentionally larger than the recommended screen. Its purpose
+is to make disciplined follow-ups immediately runnable, not to imply that 25
+variants should all consume validation-selection budget.
 
 ### Stage 0: engineering smoke test
 
@@ -204,29 +243,27 @@ valid capacity match.
 These frozen-tensor-compatible ideas are intentionally not bundled into the
 first screen. They are ordered roughly by expected information value.
 
-1. Relation-specific sparse multi-head edge attention, separately localized to
-   instruction relations and block CFG edges.
-2. GPS-style parallel local message passing and containment-bounded attention,
+1. GPS-style parallel local message passing and containment-bounded attention,
    with a learned merge at instruction and block scales.
-3. Virtual block and function tokens that recurrently exchange state with
+2. Virtual block and function tokens that recurrently exchange state with
    their contained nodes, without replacing the existing multi-statistic pool.
-4. Call-site cross-attention over completed callee states, testing a richer
+3. Call-site cross-attention over completed callee states, testing a richer
    replacement for the current projected mean injection.
-5. Jumping-knowledge connections over instruction and block depths, followed
+4. Jumping-knowledge connections over instruction and block depths, followed
    by a deeper pre-norm residual stack.
-6. Learned attention/set-transformer pooling as a separate pooling study.
-7. Hierarchical Perceiver latents for a deliberately high-capacity surrogate.
-8. Resource/timing-specific encoders or conditional mixture-of-experts. This
+5. Learned attention/set-transformer pooling as a separate pooling study.
+6. Hierarchical Perceiver latents for a deliberately high-capacity surrogate.
+7. Resource/timing-specific encoders or conditional mixture-of-experts. This
    changes representation routing or heads and should not be reported as a
    message-operator result.
-9. Graphormer-style shortest-path or structural biases computed on the fly
+8. Graphormer-style shortest-path or structural biases computed on the fly
     from existing edges. This requires no tensor regeneration but has enough
     engineering and compute cost to justify a later study.
 
 ## Expected compute
 
-Twenty-three scheduled candidates at two 50%-data fits each cost roughly
-twenty-three full-data-fit equivalents before early-stopping and architecture-cost
+The recommended 11-candidate first wave at two 50%-data fits costs roughly
+eleven full-data-fit equivalents before early-stopping and architecture-cost
 differences because the two canonical fits already exist. A canonical-plus-five
 shortlist over three full-data seeds costs another eighteen full fits. The
 attention and wide models will cost more per example, so GPU-hours and peak
@@ -234,8 +271,8 @@ memory—not fit counts alone—must accompany the accuracy frontier.
 
 ## Commands
 
-The default screen schedules all twenty-three implemented candidates and reuses
-E6 H0 automatically:
+The runner requires an explicit subset and reuses E6 H0 automatically. Launch
+the recommended diverse first wave with:
 
 ```bash
 /home/brend/anaconda3/bin/conda run -n pipeline-env --no-capture-output \
@@ -243,15 +280,20 @@ E6 H0 automatically:
   --stage screen \
   --tensor-dir /home/brend/projects/data/tensors \
   --output-dir artifacts/results/e7_message_operator_screen_v1 \
+  --candidate-set core \
   --devices 0 1 2 3 \
   --dry-run
 ```
 
-Remove `--dry-run` only after checking the 46-job index. Analyze validation
-predictions without touching test outputs:
+For smaller batches, replace the named set with, for example,
+`--candidates receiver_gate pna edge_attention`. Sequential subset launches
+into the same output directory safely accumulate campaign metadata and job
+index entries. Remove `--dry-run` only after checking the selected job index.
+Analyze a completed subset without touching test outputs:
 
 ```bash
 /home/brend/anaconda3/bin/conda run -n pipeline-env --no-capture-output \
   python scripts/analyze_e7_screen.py \
-  --results-dir artifacts/results/e7_message_operator_screen_v1
+  --results-dir artifacts/results/e7_message_operator_screen_v1 \
+  --candidates receiver_gate pna edge_attention
 ```

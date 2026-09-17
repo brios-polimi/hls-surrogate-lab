@@ -22,6 +22,7 @@ sys.path.insert(0, str(_REPO_ROOT / "src"))
 
 from ll_hls4ml.models.hierarchical_operators import OPERATOR_PROFILES
 from ll_hls4ml.models.hierarchical_attention import ATTENTION_PROFILES
+from ll_hls4ml.models.hierarchical_edge_attention import EDGE_ATTENTION_PROFILES
 from ll_hls4ml.models.hierarchical_variables import VARIABLE_ROUTE_PROFILES
 from ll_hls4ml.io.schema import DERIVED_DEF_USE_EDGE
 from scripts.run_e2 import (
@@ -54,14 +55,41 @@ PERFORMANCE_CANDIDATES = tuple(
     name for name, spec in OPERATOR_PROFILES.items() if spec.rank is None
 )
 ATTENTION_CANDIDATES = tuple(ATTENTION_PROFILES)
+EDGE_ATTENTION_CANDIDATES = tuple(EDGE_ATTENTION_PROFILES)
 VARIABLE_CANDIDATES = tuple(VARIABLE_ROUTE_PROFILES)
 SCREEN_CANDIDATES = (
     *MECHANISM_CANDIDATES,
     *PERFORMANCE_CANDIDATES,
     *ATTENTION_CANDIDATES,
+    *EDGE_ATTENTION_CANDIDATES,
     *VARIABLE_CANDIDATES,
 )
 ALL_CANDIDATES = ("canonical", *SCREEN_CANDIDATES)
+
+# A first wave chosen for diversity of inductive bias, not an assertion that
+# the omitted ladder/capacity variants are uninteresting. The remaining models
+# are conditional follow-ups once a parent mechanism is promising.
+CORE_CANDIDATES = (
+    "receiver_gate",
+    "bidirectional",
+    "gate_bidir",
+    "pna",
+    "pna_gate_bidir",
+    "wide_full_operator",
+    "edge_attention",
+    "attn_instruction",
+    "attn_block",
+    "attn_dual",
+    "variable_route_all",
+)
+CANDIDATE_SETS = {
+    "core": CORE_CANDIDATES,
+    "mechanism": MECHANISM_CANDIDATES,
+    "performance": PERFORMANCE_CANDIDATES,
+    "attention": (*ATTENTION_CANDIDATES, *EDGE_ATTENTION_CANDIDATES),
+    "variable": VARIABLE_CANDIDATES,
+    "all": SCREEN_CANDIDATES,
+}
 
 
 def candidate_track(candidate: str) -> str:
@@ -73,6 +101,8 @@ def candidate_track(candidate: str) -> str:
         return "performance"
     if candidate in ATTENTION_CANDIDATES:
         return "attention"
+    if candidate in EDGE_ATTENTION_CANDIDATES:
+        return "edge_attention"
     if candidate in VARIABLE_CANDIDATES:
         return "variable"
     raise ValueError(f"Unknown E7 candidate: {candidate}")
@@ -153,6 +183,11 @@ def candidate_config(candidate: str) -> dict:
         return {
             "model": "hierarchical_attention",
             **ATTENTION_PROFILES[candidate],
+        }
+    if candidate in EDGE_ATTENTION_PROFILES:
+        return {
+            "model": "hierarchical_edge_attention",
+            **EDGE_ATTENTION_PROFILES[candidate],
         }
     if candidate in VARIABLE_ROUTE_PROFILES:
         return {
@@ -330,6 +365,68 @@ def _write_index(path: Path, jobs: list[Job]) -> None:
     temporary = path.with_suffix(".tmp")
     temporary.write_text(json.dumps([asdict(job) for job in jobs], indent=2) + "\n")
     temporary.replace(path)
+
+
+def _write_campaign_metadata(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    temporary.replace(path)
+
+
+def _merge_jobs(path: Path, jobs: list[Job]) -> list[Job]:
+    """Accumulate sequential subset launches in one campaign directory."""
+    merged: dict[tuple[str, int], Job] = {}
+    if path.is_file():
+        for raw in json.loads(path.read_text()):
+            previous = Job(**raw)
+            merged[(previous.candidate, previous.seed)] = previous
+    for job in jobs:
+        merged[(job.candidate, job.seed)] = job
+    candidate_order = {name: index for index, name in enumerate(ALL_CANDIDATES)}
+    return sorted(
+        merged.values(),
+        key=lambda job: (candidate_order[job.candidate], job.seed),
+    )
+
+
+def _merge_metadata(path: Path, current: dict) -> dict:
+    if not path.is_file():
+        return current
+    previous = json.loads(path.read_text())
+    for key in (
+        "study_id",
+        "protocol_id",
+        "stage",
+        "tensor_dir",
+        "vocab_path",
+        "base_config_path",
+        "reused_screen_baseline_root",
+    ):
+        if key in previous and previous.get(key) != current.get(key):
+            raise ValueError(
+                f"Cannot mix incompatible E7 campaigns in {path}: {key}"
+            )
+    candidate_order = {name: index for index, name in enumerate(ALL_CANDIDATES)}
+    candidates = sorted(
+        set(previous.get("candidates", ())) | set(current["candidates"]),
+        key=candidate_order.__getitem__,
+    )
+    seeds = sorted(set(previous.get("seeds", ())) | set(current["seeds"]))
+    merged = {**previous, **current, "candidates": candidates, "seeds": seeds}
+    for key in (
+        "operator_specs",
+        "candidate_configs",
+        "candidate_tracks",
+        "pna_avg_log_degrees",
+        "split_hashes",
+    ):
+        old = {str(name): value for name, value in previous.get(key, {}).items()}
+        new = {str(name): value for name, value in current.get(key, {}).items()}
+        merged[key] = {**old, **new}
+    merged["last_invocation_candidates"] = current["candidates"]
+    merged["last_invocation_seeds"] = current["seeds"]
+    return merged
 
 
 def _materialize(args, base: dict) -> list[Job]:
@@ -512,7 +609,13 @@ def main() -> None:
         type=Path,
         default=_REPO_ROOT / "configs/studies/e2_replication.yaml",
     )
-    parser.add_argument("--candidates", nargs="+", choices=ALL_CANDIDATES)
+    selection = parser.add_mutually_exclusive_group()
+    selection.add_argument("--candidates", nargs="+", choices=ALL_CANDIDATES)
+    selection.add_argument(
+        "--candidate-set",
+        choices=tuple(CANDIDATE_SETS),
+        help="Named subset; 'core' is the recommended diverse first wave.",
+    )
     parser.add_argument("--seeds", nargs="+", type=int)
     parser.add_argument("--devices", nargs="+", default=["0"])
     parser.add_argument("--jobs-per-device", type=int, default=1)
@@ -530,11 +633,13 @@ def main() -> None:
         if args.stage == "smoke"
         else [7, 42, 137] if args.stage == "confirm" else [7, 42]
     )
-    args.candidates = args.candidates or (
-        list(SCREEN_CANDIDATES) if args.stage != "confirm" else None
-    )
+    if args.candidate_set:
+        args.candidates = list(CANDIDATE_SETS[args.candidate_set])
     if args.candidates is None:
-        parser.error("--candidates is required for confirmation")
+        parser.error(
+            "choose an explicit --candidates subset or --candidate-set; "
+            "use --candidate-set core for the recommended first wave"
+        )
     if len(args.seeds) != len(set(args.seeds)):
         parser.error("--seeds must not contain duplicates")
     if len(args.candidates) != len(set(args.candidates)):
@@ -569,17 +674,19 @@ def main() -> None:
     slots = [device for device in args.devices for _ in range(args.jobs_per_device)]
     for index, job in enumerate(jobs):
         job.device = slots[index % len(slots)]
-    args.all_jobs = jobs
     metadata = {
         "study_id": STUDY_ID,
         "protocol_id": PROTOCOL_ID,
         "stage": args.stage,
+        "tensor_dir": str(args.tensor_dir),
+        "vocab_path": str(args.vocab),
+        "base_config_path": str(args.base_config),
         "candidates": args.candidates,
         "seeds": args.seeds,
         "operator_specs": {
             name: asdict(OPERATOR_PROFILES[candidate_config(name)["operator_profile"]])
             for name in args.candidates
-            if name != "canonical"
+            if candidate_config(name).get("operator_profile") in OPERATOR_PROFILES
         },
         "candidate_configs": {
             name: candidate_config(name) for name in args.candidates
@@ -599,9 +706,12 @@ def main() -> None:
             "wall_clock": "not matched; recorded per run",
         },
     }
-    _write_stable_json(args.output_dir / "study_metadata.json", metadata)
+    metadata_path = args.output_dir / "study_metadata.json"
+    metadata = _merge_metadata(metadata_path, metadata)
+    _write_campaign_metadata(metadata_path, metadata)
     index_path = args.output_dir / "study_index.json"
-    _write_index(index_path, jobs)
+    args.all_jobs = _merge_jobs(index_path, jobs)
+    _write_index(index_path, args.all_jobs)
     runnable = [job for job in jobs if job.status == "PENDING"]
     blocked = [job for job in jobs if job.status.startswith("BLOCKED")]
     if args.dry_run:

@@ -230,6 +230,22 @@ def _contrast_rows(
                 ),
                 "training_contract_matched": True,
                 "same_commit": False,
+                "candidate_best_epoch": config.get("best_epoch"),
+                "baseline_best_epoch": baseline_config.get("best_epoch"),
+                "candidate_training_seconds": config.get(
+                    "cumulative_training_seconds"
+                ),
+                "baseline_training_seconds": baseline_config.get(
+                    "cumulative_training_seconds"
+                ),
+                "candidate_wall_seconds": config.get("wall_seconds"),
+                "baseline_wall_seconds": baseline_config.get("wall_seconds"),
+                "candidate_peak_gpu_memory_mb": config.get(
+                    "peak_gpu_memory_mb"
+                ),
+                "baseline_peak_gpu_memory_mb": baseline_config.get(
+                    "peak_gpu_memory_mb"
+                ),
             }
         )
     return output
@@ -257,13 +273,22 @@ def _promotion_rows(contrasts: list[dict]) -> list[dict]:
             for level in ("resource", "timing")
         }
         deltas = [row["delta_smape"] for row in overall]
-        ordinary = all(delta < 0 for delta in deltas) and np.mean(deltas) <= -0.3
-        strong_one = min(deltas) <= -1.0 and max(deltas) <= 0.3
+        complete_replicates = len(overall) >= 2
+        ordinary = (
+            complete_replicates
+            and all(delta < 0 for delta in deltas)
+            and np.mean(deltas) <= -0.3
+        )
+        strong_one = (
+            complete_replicates
+            and min(deltas) <= -1.0
+            and max(deltas) <= 0.3
+        )
         guardrail_failure = any(
             len(values) >= 2 and sum(value > 1.0 for value in values) >= 2
             for values in scope.values()
         )
-        promote = (ordinary or strong_one) and not guardrail_failure
+        eligible = (ordinary or strong_one) and not guardrail_failure
         output.append(
             {
                 "candidate": candidate,
@@ -276,12 +301,53 @@ def _promotion_rows(contrasts: list[dict]) -> list[dict]:
                 "ordinary_rule": ordinary,
                 "strong_one_rule": strong_one,
                 "scope_guardrail_failure": guardrail_failure,
-                "promotion_recommendation": promote,
+                "complete_replicates": complete_replicates,
+                "promotion_eligible": eligible,
+                "promotion_recommendation": False,
+                "selection_rank": None,
                 "parameter_count": overall[0]["candidate_parameters"],
                 "parameter_matched": overall[0]["parameter_matched"],
+                "mean_training_seconds": float(
+                    np.mean(
+                        [
+                            row["candidate_training_seconds"]
+                            for row in overall
+                            if row.get("candidate_training_seconds") is not None
+                        ]
+                    )
+                )
+                if any(
+                    row.get("candidate_training_seconds") is not None
+                    for row in overall
+                )
+                else None,
+                "max_peak_gpu_memory_mb": max(
+                    (
+                        row["candidate_peak_gpu_memory_mb"]
+                        for row in overall
+                        if row.get("candidate_peak_gpu_memory_mb") is not None
+                    ),
+                    default=None,
+                ),
             }
         )
-    return sorted(output, key=lambda row: row["mean_delta_smape"])
+    output.sort(key=lambda row: row["mean_delta_smape"])
+    eligible = [row for row in output if row["promotion_eligible"]]
+    selected = []
+    for tracks in (("mechanism",), ("performance", "attention", "edge_attention")):
+        reserved = next(
+            (row for row in eligible if row["track"] in tracks), None
+        )
+        if reserved is not None and reserved not in selected:
+            selected.append(reserved)
+    for row in eligible:
+        if row not in selected and len(selected) < 5:
+            selected.append(row)
+    selected = sorted(selected[:5], key=lambda row: row["mean_delta_smape"])
+    for rank, row in enumerate(selected, start=1):
+        row["promotion_recommendation"] = True
+        row["selection_rank"] = rank
+    return output
 
 
 def _write_report(path: Path, promotions: list[dict]) -> None:
@@ -291,14 +357,15 @@ def _write_report(path: Path, promotions: list[dict]) -> None:
         "Negative deltas favour the candidate. These are promotion diagnostics, "
         "not test-set results.",
         "",
-        "| candidate | track | seed deltas | mean delta | parameters | rule recommendation |",
-        "|---|---|---:|---:|---:|---|",
+        "| candidate | track | seed deltas | mean delta | parameters | eligible | shortlist |",
+        "|---|---|---:|---:|---:|---|---|",
     ]
     for row in promotions:
         lines.append(
             f"| `{row['candidate']}` | {row['track']} | {row['overall_deltas']} | "
             f"{row['mean_delta_smape']:.3f} | {row['parameter_count']} | "
-            f"{'advance' if row['promotion_recommendation'] else 'do not advance'} |"
+            f"{'yes' if row['promotion_eligible'] else 'no'} | "
+            f"{row['selection_rank'] or '-'} |"
         )
     lines.extend(
         [

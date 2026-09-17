@@ -1,7 +1,16 @@
+import json
+from pathlib import Path
+import tempfile
 import unittest
 
 from scripts.analyze_e7_screen import _promotion_rows
-from scripts.run_e7_message_operators import SCREEN_CANDIDATES, candidate_track
+from scripts.run_e7_message_operators import (
+    Job,
+    SCREEN_CANDIDATES,
+    _merge_jobs,
+    _merge_metadata,
+    candidate_track,
+)
 
 
 def _row(candidate, seed, level, delta):
@@ -18,11 +27,12 @@ def _row(candidate, seed, level, delta):
 
 class PromotionRuleTests(unittest.TestCase):
     def test_candidate_catalog_is_explicit_and_unique(self):
-        self.assertEqual(len(SCREEN_CANDIDATES), 23)
+        self.assertEqual(len(SCREEN_CANDIDATES), 25)
         self.assertEqual(len(SCREEN_CANDIDATES), len(set(SCREEN_CANDIDATES)))
         self.assertEqual(candidate_track("pna"), "mechanism")
         self.assertEqual(candidate_track("pna_wide"), "performance")
         self.assertEqual(candidate_track("attn_dual"), "attention")
+        self.assertEqual(candidate_track("edge_attention"), "edge_attention")
         self.assertEqual(candidate_track("variable_route_all"), "variable")
 
     def test_consistent_small_improvement_advances(self):
@@ -51,6 +61,41 @@ class PromotionRuleTests(unittest.TestCase):
         self.assertTrue(result["scope_guardrail_failure"])
         self.assertFalse(result["promotion_recommendation"])
 
+    def test_subset_launches_accumulate_campaign_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            index = root / "index.json"
+            first = Job("pna", 7, "a", "/a", "/a.log", "/a.json")
+            second = Job("attn_dual", 42, "b", "/b", "/b.log", "/b.json")
+            index.write_text(json.dumps([first.__dict__]))
+            merged = _merge_jobs(index, [second])
+            self.assertEqual(
+                {(job.candidate, job.seed) for job in merged},
+                {("pna", 7), ("attn_dual", 42)},
+            )
+
+            metadata_path = root / "metadata.json"
+            previous = {
+                "study_id": "s",
+                "protocol_id": "p",
+                "stage": "screen",
+                "candidates": ["pna"],
+                "seeds": [7],
+                "candidate_configs": {"pna": {}},
+            }
+            metadata_path.write_text(json.dumps(previous))
+            current = {
+                "study_id": "s",
+                "protocol_id": "p",
+                "stage": "screen",
+                "candidates": ["attn_dual"],
+                "seeds": [42],
+                "candidate_configs": {"attn_dual": {}},
+            }
+            merged_metadata = _merge_metadata(metadata_path, current)
+            self.assertEqual(set(merged_metadata["candidates"]), {"pna", "attn_dual"})
+            self.assertEqual(merged_metadata["seeds"], [7, 42])
+
     def test_one_unstable_win_does_not_advance(self):
         rows = [
             _row("relation_mixer", 7, "overall", -1.5),
@@ -63,6 +108,16 @@ class PromotionRuleTests(unittest.TestCase):
         result = _promotion_rows(rows)[0]
         self.assertFalse(result["ordinary_rule"])
         self.assertFalse(result["strong_one_rule"])
+        self.assertFalse(result["promotion_recommendation"])
+
+    def test_one_seed_is_never_promoted(self):
+        rows = [
+            _row("pna", 7, "overall", -3.0),
+            _row("pna", 7, "resource", -2.0),
+            _row("pna", 7, "timing", -4.0),
+        ]
+        result = _promotion_rows(rows)[0]
+        self.assertFalse(result["complete_replicates"])
         self.assertFalse(result["promotion_recommendation"])
 
 

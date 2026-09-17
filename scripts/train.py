@@ -127,6 +127,7 @@ def _model_from_config(config: dict, vocab_size: int, max_pos: int, train_ds):
     hierarchical_models = {
         "hierarchical",
         "hierarchical_attention",
+        "hierarchical_edge_attention",
         "hierarchical_operator",
         "hierarchical_variable_route",
         "hierarchical_no_local_message",
@@ -195,6 +196,7 @@ def _model_from_config(config: dict, vocab_size: int, max_pos: int, train_ds):
         "hetero_relational",
         "hierarchical",
         "hierarchical_attention",
+        "hierarchical_edge_attention",
         "hierarchical_operator",
         "hierarchical_variable_route",
         "hierarchical_no_local_message",
@@ -250,6 +252,17 @@ def _model_from_config(config: dict, vocab_size: int, max_pos: int, train_ds):
                         ),
                         "attention_pair_budget": config.get(
                             "attention_pair_budget", 131_072
+                        ),
+                    }
+                )
+            if model_name == "hierarchical_edge_attention":
+                common.update(
+                    {
+                        "edge_attention_bidirectional": config.get(
+                            "edge_attention_bidirectional", False
+                        ),
+                        "edge_attention_heads": config.get(
+                            "edge_attention_heads", 4
                         ),
                     }
                 )

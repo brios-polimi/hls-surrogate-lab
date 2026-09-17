@@ -8,6 +8,9 @@ from ll_hls4ml.models.hetero_gat import CDFGHeteroGAT
 from ll_hls4ml.models.hetero_relational import CDFGHeteroRelational
 from ll_hls4ml.models.hierarchical import CDFGHierarchical
 from ll_hls4ml.models.hierarchical_attention import CDFGHierarchicalAttention
+from ll_hls4ml.models.hierarchical_edge_attention import (
+    CDFGHierarchicalEdgeAttention,
+)
 from ll_hls4ml.models.hierarchical_operators import CDFGHierarchicalOperator
 from ll_hls4ml.models.hierarchical_variables import CDFGHierarchicalVariableRoute
 from ll_hls4ml.models.hierarchical_experimental import (
@@ -28,6 +31,7 @@ MODELS: dict[str, type[nn.Module]] = {
     "hetero_relational": CDFGHeteroRelational,
     "hierarchical": CDFGHierarchical,
     "hierarchical_attention": CDFGHierarchicalAttention,
+    "hierarchical_edge_attention": CDFGHierarchicalEdgeAttention,
     "hierarchical_operator": CDFGHierarchicalOperator,
     "hierarchical_variable_route": CDFGHierarchicalVariableRoute,
     "hierarchical_no_local_message": CDFGHierarchical,
